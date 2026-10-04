@@ -1,0 +1,20 @@
+[package]
+name = "partail"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Follow several log files in parallel, with regex-based colouring"
+readme = "README.md"
+keywords = ["tail", "log", "tui", "terminal"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+unwrap_used = "warn"
+indexing_slicing = "warn"
