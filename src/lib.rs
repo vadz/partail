@@ -2,3 +2,7 @@
 //!
 //! This library contains everything that doesn't depend on the terminal UI:
 //! configuration, line processing and file following.
+
+pub mod config;
+pub mod pattern;
+pub mod style;
