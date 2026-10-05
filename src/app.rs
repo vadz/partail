@@ -1,5 +1,6 @@
 //! The terminal UI: windows showing the followed files and the event loop.
 
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::num::NonZeroU16;
 use std::sync::Arc;
@@ -24,6 +25,9 @@ const POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// Style of the status lines.
 const STATUS_STYLE: Style = Style::new().add_modifier(Modifier::REVERSED);
 
+/// Style of the status line of the focused window, if there are several.
+const FOCUSED_STATUS_STYLE: Style = STATUS_STYLE.add_modifier(Modifier::BOLD);
+
 /// Marker appended to the parts of a too long line.
 const LONG_LINE_MARKER: &str = "\\";
 
@@ -31,6 +35,8 @@ const LONG_LINE_MARKER: &str = "\\";
 pub struct App {
     panes: Vec<Pane>,
     status: StatusFormat,
+    /// Index of the window the scrolling keys apply to.
+    focus: usize,
 }
 
 /// A window showing one file.
@@ -44,6 +50,29 @@ struct Pane {
     scrollback: usize,
     /// Number of lines read since the start.
     lines_read: u64,
+    /// Number of lines below the view, 0 if following the end of the file.
+    ///
+    /// The incomplete last line, if any, counts as a line here and in all
+    /// the scrolling-related functions below.
+    ///
+    /// This may be greater than the maximal possible offset, see
+    /// [`Pane::effective_offset`].
+    offset: usize,
+    /// Area used for showing the lines when the window was last drawn.
+    content_area: Cell<Rect>,
+}
+
+/// How to scroll a window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Scroll {
+    LineUp,
+    LineDown,
+    PageUp,
+    PageDown,
+    /// Show the oldest lines.
+    Top,
+    /// Show the most recent lines and follow the file again.
+    Bottom,
 }
 
 impl App {
@@ -61,11 +90,33 @@ impl App {
                 lines: VecDeque::new(),
                 scrollback: config.scrollback.get(),
                 lines_read: 0,
+                offset: 0,
+                content_area: Cell::default(),
             })
             .collect();
         Self {
             panes,
             status: config.status,
+            focus: 0,
+        }
+    }
+
+    /// Scrolls the focused window.
+    fn scroll(&mut self, scroll: Scroll) {
+        if let Some(pane) = self.panes.get_mut(self.focus) {
+            pane.scroll(scroll);
+        }
+    }
+
+    /// Focuses the next window, or the previous one if `forward` is false.
+    fn move_focus(&mut self, forward: bool) {
+        let count = self.panes.len();
+        if count > 0 {
+            self.focus = if forward {
+                (self.focus + 1) % count
+            } else {
+                (self.focus + count - 1) % count
+            };
         }
     }
 
@@ -86,8 +137,10 @@ impl App {
             None => Constraint::Fill(1),
         });
         let areas = Layout::vertical(constraints).split(frame.area());
-        for (pane, area) in self.panes.iter().zip(areas.iter()) {
-            pane.draw(*area, frame.buffer_mut(), &self.status);
+        let several = self.panes.len() > 1;
+        for (index, (pane, area)) in self.panes.iter().zip(areas.iter()).enumerate() {
+            let focused = several && index == self.focus;
+            pane.draw(*area, frame.buffer_mut(), &self.status, focused);
         }
     }
 }
@@ -115,12 +168,41 @@ impl Pane {
         };
 
         let before = state(&self.follower);
+        let had_partial = self.has_partial();
         let events = self.follower.poll();
         let changed = !events.is_empty() || state(&self.follower) != before;
         for event in events {
             self.handle(event);
         }
+
+        // Each new line has already been accounted for by handle(), but the
+        // incomplete line may have appeared or disappeared, e.g. when it
+        // became a complete line, which shouldn't change the view.
+        if self.offset > 0 {
+            match (had_partial, self.has_partial()) {
+                (false, true) => self.offset += 1,
+                (true, false) => self.offset -= 1,
+                _ => {}
+            }
+        }
+        self.offset = self.offset.min(self.line_count().saturating_sub(1));
+
         changed
+    }
+
+    fn has_partial(&self) -> bool {
+        !self.follower.partial().is_empty()
+    }
+
+    /// Returns the number of lines, including the incomplete last line.
+    fn line_count(&self) -> usize {
+        self.lines.len() + usize::from(self.has_partial())
+    }
+
+    /// Returns the incomplete last line processed for showing it, if any.
+    fn partial_line(&self) -> Option<Line> {
+        self.has_partial()
+            .then(|| line::process(self.follower.partial(), &self.scheme))
     }
 
     fn handle(&mut self, event: Event) {
@@ -139,30 +221,117 @@ impl Pane {
         };
 
         self.lines.push_back(line);
+
+        // Keep showing the same lines if scrolled.
+        if self.offset > 0 {
+            self.offset += 1;
+        }
+
         while self.lines.len() > self.scrollback {
             self.lines.pop_front();
         }
+        self.offset = self.offset.min(self.line_count().saturating_sub(1));
     }
 
-    fn draw(&self, area: Rect, buf: &mut Buffer, format: &StatusFormat) {
+    /// Returns the number of rows taken by the line with the given index,
+    /// which is the incomplete line if it's equal to the number of complete
+    /// lines, when wrapped at the given width.
+    fn rows(&self, index: usize, width: u16) -> usize {
+        let rows = match self.lines.get(index) {
+            Some(line) => wrap::row_count(line, width),
+            None => self
+                .partial_line()
+                .map_or(1, |line| wrap::row_count(&line, width)),
+        };
+        rows.max(1)
+    }
+
+    /// Returns the maximal offset for the given area, i.e. the one for which
+    /// the oldest line is at the top of it, or 0 if all lines fit into it.
+    fn max_offset(&self, area: Rect) -> usize {
+        let height = usize::from(area.height).max(1);
+        let count = self.line_count();
+        let mut rows = 0;
+        for index in 0..count {
+            rows += self.rows(index, area.width);
+            if rows >= height {
+                return count - 1 - index;
+            }
+        }
+        0
+    }
+
+    /// Returns the offset to use for the given area, which may be less than
+    /// the requested one to avoid leaving the top of the window empty.
+    fn effective_offset(&self, area: Rect) -> usize {
+        self.offset.min(self.max_offset(area))
+    }
+
+    /// Returns the number of lines, at least partially, visible in the area
+    /// with the given offset.
+    fn visible_lines(&self, offset: usize, area: Rect) -> usize {
+        let height = usize::from(area.height).max(1);
+        let Some(bottom) = self.line_count().checked_sub(offset + 1) else {
+            return 0;
+        };
+        let mut rows = 0;
+        let mut count = 0;
+        for index in (0..=bottom).rev() {
+            rows += self.rows(index, area.width);
+            count += 1;
+            if rows >= height {
+                break;
+            }
+        }
+        count
+    }
+
+    fn scroll(&mut self, scroll: Scroll) {
+        let area = self.content_area.get();
+        let offset = self.effective_offset(area);
+
+        // Keep one line visible when scrolling by pages, but always scroll.
+        let page = self.visible_lines(offset, area).saturating_sub(1).max(1);
+        let offset = match scroll {
+            Scroll::LineUp => offset + 1,
+            Scroll::LineDown => offset.saturating_sub(1),
+            Scroll::PageUp => offset + page,
+            Scroll::PageDown => offset.saturating_sub(page),
+            Scroll::Top => usize::MAX,
+            Scroll::Bottom => 0,
+        };
+        self.offset = offset.min(self.max_offset(area));
+    }
+
+    fn draw(&self, area: Rect, buf: &mut Buffer, format: &StatusFormat, focused: bool) {
         let [content, status] =
             Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(area);
-        self.draw_lines(content, buf);
-        self.draw_status(status, buf, format);
+        self.content_area.set(content);
+        let offset = self.effective_offset(content);
+        self.draw_lines(content, buf, offset);
+        self.draw_status(status, buf, format, offset, focused);
     }
 
-    /// Draws the most recent lines, the last one at the bottom.
-    fn draw_lines(&self, area: Rect, buf: &mut Buffer) {
+    /// Draws the lines with the given offset, the last one at the bottom.
+    fn draw_lines(&self, area: Rect, buf: &mut Buffer, offset: usize) {
         if area.is_empty() {
             return;
         }
 
-        // The incomplete last line is shown too, as it may never be completed.
-        let partial = self.follower.partial();
-        let partial = (!partial.is_empty()).then(|| line::process(partial, &self.scheme));
+        // The incomplete last line is shown too when following the file, as
+        // it may never be completed.
+        let partial = if offset == 0 {
+            self.partial_line()
+        } else {
+            None
+        };
 
+        let end = self
+            .line_count()
+            .saturating_sub(offset)
+            .min(self.lines.len());
         let mut y = area.bottom();
-        for line in partial.iter().chain(self.lines.iter().rev()) {
+        for line in partial.iter().chain(self.lines.range(..end).rev()) {
             for row in wrap::wrap(line, area.width).iter().rev() {
                 if y == area.top() {
                     return;
@@ -173,7 +342,14 @@ impl Pane {
         }
     }
 
-    fn draw_status(&self, area: Rect, buf: &mut Buffer, format: &StatusFormat) {
+    fn draw_status(
+        &self,
+        area: Rect,
+        buf: &mut Buffer,
+        format: &StatusFormat,
+        offset: usize,
+        focused: bool,
+    ) {
         if area.is_empty() {
             return;
         }
@@ -181,12 +357,18 @@ impl Pane {
         let values = Values {
             path: self.follower.path(),
             lines: self.lines_read,
+            scroll: offset,
             size: self.follower.size(),
             modified: self.follower.modified(),
             status: self.follower.status(),
         };
 
-        buf.set_style(area, STATUS_STYLE);
+        let style = if focused {
+            FOCUSED_STATUS_STYLE
+        } else {
+            STATUS_STYLE
+        };
+        buf.set_style(area, style);
 
         // The file name and the error message can contain anything, so
         // process them like the file contents.
@@ -221,14 +403,7 @@ impl Pane {
         for (row, x) in [(left, 0), (center, center_x), (right, right_x)] {
             if let Some(row) = row {
                 let x = area.x + x;
-                draw_row(
-                    &row,
-                    x,
-                    area.y,
-                    area.right().saturating_sub(x),
-                    buf,
-                    STATUS_STYLE,
-                );
+                draw_row(&row, x, area.y, area.right().saturating_sub(x), buf, style);
             }
         }
     }
@@ -293,6 +468,14 @@ pub fn run(terminal: &mut DefaultTerminal, app: &mut App) -> anyhow::Result<()> 
                     redraw = true;
                 }
                 Some(Action::Resized) => redraw = true,
+                Some(Action::Scroll(scroll)) => {
+                    app.scroll(scroll);
+                    redraw = true;
+                }
+                Some(Action::Focus { forward }) => {
+                    app.move_focus(forward);
+                    redraw = true;
+                }
                 None => {}
             }
         }
@@ -319,6 +502,12 @@ enum Action {
     Redraw,
     /// The terminal size changed, so everything must be drawn again.
     Resized,
+    /// Scroll the focused window.
+    Scroll(Scroll),
+    /// Focus the next or previous window.
+    Focus {
+        forward: bool,
+    },
 }
 
 fn action(event: &TermEvent) -> Option<Action> {
@@ -335,6 +524,14 @@ fn action(event: &TermEvent) -> Option<Action> {
         KeyCode::Char('q') => Some(Action::Quit),
         KeyCode::Char('c') if ctrl => Some(Action::Quit),
         KeyCode::Char('l') if ctrl => Some(Action::Redraw),
+        KeyCode::Up => Some(Action::Scroll(Scroll::LineUp)),
+        KeyCode::Down => Some(Action::Scroll(Scroll::LineDown)),
+        KeyCode::PageUp => Some(Action::Scroll(Scroll::PageUp)),
+        KeyCode::PageDown => Some(Action::Scroll(Scroll::PageDown)),
+        KeyCode::Home => Some(Action::Scroll(Scroll::Top)),
+        KeyCode::End => Some(Action::Scroll(Scroll::Bottom)),
+        KeyCode::Tab => Some(Action::Focus { forward: true }),
+        KeyCode::BackTab => Some(Action::Focus { forward: false }),
         _ => None,
     }
 }
@@ -539,6 +736,246 @@ mod tests {
         assert!(!app.poll().changed);
     }
 
+    /// Creates an application with a single window containing the given
+    /// lines and showing the scroll position in its status line.
+    fn scrollable_app(lines: &[&str], scrollback: usize) -> App {
+        let mut app = make_app_with_status(&[("f", None)], scrollback, ["{scroll}", "", ""]);
+        add_lines(&mut app, 0, lines);
+        app
+    }
+
+    /// Scrolls the application and returns the screen contents.
+    fn scroll(app: &mut App, scroll: Scroll, width: u16, height: u16) -> Vec<String> {
+        app.scroll(scroll);
+        render(app, width, height)
+    }
+
+    #[test]
+    fn scrolling() {
+        let lines: Vec<String> = (1..=10).map(|n| n.to_string()).collect();
+        let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let mut app = scrollable_app(&lines, 100);
+
+        assert_eq!(render(&app, 3, 4), ["8  ", "9  ", "10 ", "   "]);
+        assert_eq!(
+            scroll(&mut app, Scroll::LineUp, 3, 4),
+            ["7  ", "8  ", "9  ", "\u{2191}1 "]
+        );
+        assert_eq!(
+            scroll(&mut app, Scroll::LineDown, 3, 4),
+            ["8  ", "9  ", "10 ", "   "]
+        );
+        // Can't scroll below the end.
+        assert_eq!(
+            scroll(&mut app, Scroll::LineDown, 3, 4),
+            ["8  ", "9  ", "10 ", "   "]
+        );
+
+        // Pages keep one line visible.
+        assert_eq!(
+            scroll(&mut app, Scroll::PageUp, 3, 4),
+            ["6  ", "7  ", "8  ", "\u{2191}2 "]
+        );
+        assert_eq!(
+            scroll(&mut app, Scroll::PageUp, 3, 4),
+            ["4  ", "5  ", "6  ", "\u{2191}4 "]
+        );
+        assert_eq!(
+            scroll(&mut app, Scroll::PageDown, 3, 4),
+            ["6  ", "7  ", "8  ", "\u{2191}2 "]
+        );
+
+        // The oldest line is shown at the top and we can't go further.
+        assert_eq!(
+            scroll(&mut app, Scroll::Top, 3, 4),
+            ["1  ", "2  ", "3  ", "\u{2191}7 "]
+        );
+        assert_eq!(
+            scroll(&mut app, Scroll::LineUp, 3, 4),
+            ["1  ", "2  ", "3  ", "\u{2191}7 "]
+        );
+        assert_eq!(
+            scroll(&mut app, Scroll::PageUp, 3, 4),
+            ["1  ", "2  ", "3  ", "\u{2191}7 "]
+        );
+
+        assert_eq!(
+            scroll(&mut app, Scroll::Bottom, 3, 4),
+            ["8  ", "9  ", "10 ", "   "]
+        );
+    }
+
+    #[test]
+    fn scrolling_with_few_lines() {
+        let mut app = scrollable_app(&["1", "2"], 100);
+        assert_eq!(
+            scroll(&mut app, Scroll::LineUp, 3, 4),
+            ["   ", "1  ", "2  ", "   "]
+        );
+        assert_eq!(
+            scroll(&mut app, Scroll::Top, 3, 4),
+            ["   ", "1  ", "2  ", "   "]
+        );
+
+        let mut app = scrollable_app(&[], 100);
+        assert_eq!(scroll(&mut app, Scroll::PageUp, 3, 2), ["   ", "   "]);
+    }
+
+    #[test]
+    fn scrolling_wrapped_lines() {
+        let mut app = scrollable_app(&["111111", "2", "333333"], 100);
+        assert_eq!(render(&app, 3, 4), ["2  ", "333", "333", "   "]);
+        assert_eq!(
+            scroll(&mut app, Scroll::LineUp, 3, 4),
+            ["111", "111", "2  ", "\u{2191}1 "]
+        );
+        assert_eq!(
+            scroll(&mut app, Scroll::LineUp, 3, 4),
+            ["111", "111", "2  ", "\u{2191}1 "]
+        );
+        assert_eq!(
+            scroll(&mut app, Scroll::PageDown, 3, 4),
+            ["2  ", "333", "333", "   "]
+        );
+    }
+
+    #[test]
+    fn scrolled_view_is_kept() {
+        let lines: Vec<String> = (1..=10).map(|n| n.to_string()).collect();
+        let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let mut app = scrollable_app(&lines, 10);
+        render(&app, 3, 4);
+        app.scroll(Scroll::PageUp);
+
+        // New lines don't change what is shown.
+        add_lines(&mut app, 0, &["11", "12"]);
+        assert_eq!(render(&app, 3, 4), ["6  ", "7  ", "8  ", "\u{2191}4 "]);
+
+        // Even when old lines are dropped, as long as the shown ones remain.
+        add_lines(&mut app, 0, &["13", "14", "15"]);
+        assert_eq!(render(&app, 3, 4), ["6  ", "7  ", "8  ", "\u{2191}7 "]);
+
+        // When they don't, the oldest remaining ones are shown.
+        add_lines(&mut app, 0, &["16"]);
+        assert_eq!(render(&app, 3, 4), ["7  ", "8  ", "9  ", "\u{2191}7 "]);
+
+        assert_eq!(
+            scroll(&mut app, Scroll::Bottom, 3, 4),
+            ["14 ", "15 ", "16 ", "   "]
+        );
+    }
+
+    #[test]
+    fn partial_line_only_shown_when_following() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log");
+        std::fs::write(&path, "1\n2\n3\nincomplete").unwrap();
+
+        let mut app =
+            make_app_with_status(&[(path.to_str().unwrap(), None)], 100, ["{scroll}", "", ""]);
+        app.poll();
+        assert_eq!(
+            render(&app, 10, 3),
+            ["3         ", "incomplete", "          "]
+        );
+        assert_eq!(
+            scroll(&mut app, Scroll::LineUp, 10, 3),
+            ["2         ", "3         ", "\u{2191}1        "]
+        );
+    }
+
+    #[test]
+    fn scrolled_view_kept_when_partial_line_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log");
+        std::fs::write(&path, "1\n2\n3\nincompl").unwrap();
+        let append = |data: &[u8]| {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            f.write_all(data).unwrap();
+        };
+
+        let mut app =
+            make_app_with_status(&[(path.to_str().unwrap(), None)], 100, ["{scroll}", "", ""]);
+        app.poll();
+        assert_eq!(
+            scroll(&mut app, Scroll::LineUp, 10, 3),
+            ["2         ", "3         ", "\u{2191}1        "]
+        );
+
+        // The incomplete line is completed and another line added.
+        append(b"ete\n4\n");
+        app.poll();
+        assert_eq!(
+            render(&app, 10, 3),
+            ["2         ", "3         ", "\u{2191}2        "]
+        );
+
+        // A new incomplete line appears.
+        append(b"5");
+        app.poll();
+        assert_eq!(
+            render(&app, 10, 3),
+            ["2         ", "3         ", "\u{2191}3        "]
+        );
+
+        assert_eq!(
+            scroll(&mut app, Scroll::Bottom, 10, 3),
+            ["4         ", "5         ", "          "]
+        );
+    }
+
+    #[test]
+    fn focus() {
+        let mut app = make_app(&[("a", None), ("b", None), ("c", None)], 100);
+        add_lines(&mut app, 0, &["a1", "a2"]);
+        add_lines(&mut app, 1, &["b1", "b2"]);
+        assert_eq!(app.focus, 0);
+
+        app.move_focus(true);
+        assert_eq!(app.focus, 1);
+        app.move_focus(true);
+        app.move_focus(true);
+        assert_eq!(app.focus, 0);
+        app.move_focus(false);
+        assert_eq!(app.focus, 2);
+        app.move_focus(false);
+        assert_eq!(app.focus, 1);
+
+        // Only the focused window is scrolled.
+        assert_eq!(
+            render(&app, 3, 6),
+            ["a2 ", " a ", "b2 ", " b ", "   ", " c "]
+        );
+        app.scroll(Scroll::LineUp);
+        assert_eq!(
+            render(&app, 3, 6),
+            ["a2 ", " a ", "b1 ", " b ", "   ", " c "]
+        );
+
+        // And its status line is in bold.
+        let mut terminal = Terminal::new(TestBackend::new(3, 6)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let buf = terminal.backend().buffer();
+        let bold = |y: u16| buf[(0, y)].modifier.contains(Modifier::BOLD);
+        assert_eq!([bold(1), bold(3), bold(5)], [false, true, false]);
+    }
+
+    #[test]
+    fn single_window_status_not_bold() {
+        let app = make_app(&[("a", None)], 100);
+        let mut terminal = Terminal::new(TestBackend::new(3, 2)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        assert!(
+            !terminal.backend().buffer()[(0, 1)]
+                .modifier
+                .contains(Modifier::BOLD)
+        );
+    }
+
     #[test]
     fn status_alignment() {
         let app = make_app_with_status(&[("f", None)], 100, ["L{name}", "C", "{name}R"]);
@@ -603,6 +1040,30 @@ mod tests {
         });
         assert_eq!(action(&release), None);
         assert_eq!(action(&TermEvent::Resize(80, 24)), Some(Action::Resized));
+        assert_eq!(
+            action(&key(KeyCode::Up, none)),
+            Some(Action::Scroll(Scroll::LineUp))
+        );
+        assert_eq!(
+            action(&key(KeyCode::PageDown, none)),
+            Some(Action::Scroll(Scroll::PageDown))
+        );
+        assert_eq!(
+            action(&key(KeyCode::Home, none)),
+            Some(Action::Scroll(Scroll::Top))
+        );
+        assert_eq!(
+            action(&key(KeyCode::End, none)),
+            Some(Action::Scroll(Scroll::Bottom))
+        );
+        assert_eq!(
+            action(&key(KeyCode::Tab, none)),
+            Some(Action::Focus { forward: true })
+        );
+        assert_eq!(
+            action(&key(KeyCode::BackTab, KeyModifiers::SHIFT)),
+            Some(Action::Focus { forward: false })
+        );
         assert_eq!(action(&TermEvent::FocusGained), None);
     }
 }

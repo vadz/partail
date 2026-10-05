@@ -34,7 +34,7 @@ pub struct StatusFormat {
 impl StatusFormat {
     pub const DEFAULT_LEFT: &str = "{file}";
     pub const DEFAULT_CENTER: &str = "{status}";
-    pub const DEFAULT_RIGHT: &str = "{lines}L {size:compact} {time}";
+    pub const DEFAULT_RIGHT: &str = "{scroll} {lines}L {size:compact} {time}";
 }
 
 impl Default for StatusFormat {
@@ -72,6 +72,8 @@ enum Part {
     File,
     Name,
     Lines,
+    /// Number of lines below the view, if scrolled.
+    Scroll,
     /// Size in human-readable units, compact or not.
     Size {
         compact: bool,
@@ -88,6 +90,8 @@ pub struct Values<'a> {
     pub path: &'a Path,
     /// Number of lines read so far.
     pub lines: u64,
+    /// Number of lines below the view, 0 if following the end of the file.
+    pub scroll: usize,
     pub size: Option<u64>,
     pub modified: Option<SystemTime>,
     pub status: &'a Status,
@@ -153,6 +157,11 @@ impl Template {
                     out.extend_from_slice(name.as_bytes());
                 }
                 Part::Lines => out.extend_from_slice(values.lines.to_string().as_bytes()),
+                Part::Scroll => {
+                    if values.scroll > 0 {
+                        out.extend_from_slice(format!("\u{2191}{}", values.scroll).as_bytes());
+                    }
+                }
                 Part::Size { compact } => {
                     let size = values
                         .size
@@ -196,6 +205,7 @@ fn parse_placeholder(placeholder: &str) -> Result<Part, TemplateError> {
         "file" => Part::File,
         "name" => Part::Name,
         "lines" => Part::Lines,
+        "scroll" => Part::Scroll,
         "size" => {
             let compact = match arg {
                 None => false,
@@ -225,7 +235,7 @@ fn parse_placeholder(placeholder: &str) -> Result<Part, TemplateError> {
         _ => {
             return Err(TemplateError(format!(
                 "unknown placeholder \"{{{placeholder}}}\", expected one of {{file}}, {{name}}, \
-                 {{lines}}, {{size}}, {{bytes}}, {{time}} or {{status}}"
+                 {{lines}}, {{scroll}}, {{size}}, {{bytes}}, {{time}} or {{status}}"
             )));
         }
     };
@@ -288,6 +298,7 @@ mod tests {
         Values {
             path: Path::new("/var/log/syslog"),
             lines: 42,
+            scroll: 0,
             size: Some(1677),
             modified: None,
             status,
@@ -311,6 +322,9 @@ mod tests {
         assert_eq!(render("{size:compact}", &v), "1.6K");
         assert_eq!(render("{bytes}", &v), "1677");
         assert_eq!(render("[{status}]", &v), "[]");
+        assert_eq!(render("[{scroll}]", &v), "[]");
+        let scrolled = Values { scroll: 123, ..v };
+        assert_eq!(render("[{scroll}]", &scrolled), "[\u{2191}123]");
         assert_eq!(
             render(" {name}: {lines}/{size} ", &v),
             " syslog: 42/1.6 KB "
@@ -364,7 +378,7 @@ mod tests {
         assert_eq!(
             parse_err("{nope}"),
             "unknown placeholder \"{nope}\", expected one of {file}, {name}, {lines}, \
-             {size}, {bytes}, {time} or {status}"
+             {scroll}, {size}, {bytes}, {time} or {status}"
         );
         assert_eq!(parse_err("{file"), "unterminated placeholder \"{file\"");
         assert_eq!(
@@ -435,6 +449,6 @@ mod tests {
         let v = values(&ok);
         assert_eq!(format.left.render(&v), b"/var/log/syslog");
         assert_eq!(format.center.render(&v), b"");
-        assert_eq!(format.right.render(&v), b"42L 1.6K -");
+        assert_eq!(format.right.render(&v), b" 42L 1.6K -");
     }
 }
