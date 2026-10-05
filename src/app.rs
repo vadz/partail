@@ -179,7 +179,7 @@ pub fn run(terminal: &mut DefaultTerminal, app: &mut App) -> anyhow::Result<()> 
     // Only the non-blank cells are drawn initially, as the alternate screen
     // is supposed to be blank, but it isn't if the terminal doesn't support
     // it, as is the case of GNU screen by default, so clear it explicitly.
-    terminal.clear()?;
+    clear(terminal)?;
 
     loop {
         let has_more = app.poll();
@@ -193,11 +193,23 @@ pub fn run(terminal: &mut DefaultTerminal, app: &mut App) -> anyhow::Result<()> 
         if event::poll(timeout)? {
             match action(&event::read()?) {
                 Some(Action::Quit) => return Ok(()),
-                Some(Action::Redraw) => terminal.clear()?,
+                Some(Action::Redraw) => clear(terminal)?,
                 None => {}
             }
         }
     }
+}
+
+/// Clears the screen and makes the next draw redraw everything.
+///
+/// This doesn't use `Terminal::clear()`, which queries the cursor position
+/// and fails if the terminal doesn't answer, while we don't need it at all.
+/// For a full screen terminal, resizing it, even to its current size, clears
+/// it without doing this.
+fn clear(terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
+    let area = terminal.size()?.into();
+    terminal.resize(area)?;
+    Ok(())
 }
 
 /// Something the user asked for.
