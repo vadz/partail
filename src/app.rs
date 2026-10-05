@@ -15,9 +15,13 @@ use anyhow::bail;
 use ratatui::DefaultTerminal;
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
-use ratatui::crossterm::event::{self, Event as TermEvent, KeyCode, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{
+    self, Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+};
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::widgets::Clear;
+use regex::{Regex, RegexBuilder};
 
 use partail::config::{Config, Scheme};
 use partail::follow::{Event, Follower};
@@ -39,6 +43,9 @@ const STATUS_STYLE: Style = Style::new().add_modifier(Modifier::REVERSED);
 /// Style of the status line of the focused window, if there are several.
 const FOCUSED_STATUS_STYLE: Style = STATUS_STYLE.add_modifier(Modifier::BOLD);
 
+/// Style used for highlighting the search matches.
+const HIGHLIGHT_STYLE: Style = Style::new().fg(Color::Black).bg(Color::Yellow);
+
 /// Marker appended to the parts of a too long line.
 const LONG_LINE_MARKER: &str = "\\";
 
@@ -48,6 +55,29 @@ pub struct App {
     status: StatusFormat,
     /// Index of the window the scrolling keys apply to.
     focus: usize,
+    /// Text entered at the search prompt, if it's shown.
+    prompt: Option<String>,
+    /// The current search, whose matches are highlighted.
+    search: Option<Search>,
+    /// Message shown instead of the status line of the focused window until
+    /// the next key press.
+    message: Option<String>,
+}
+
+/// A search for a regex.
+struct Search {
+    pattern: String,
+    regex: Regex,
+}
+
+/// What the event loop must do after handling an event.
+#[derive(Debug, PartialEq, Eq)]
+enum Response {
+    Nothing,
+    Redraw,
+    /// Clear the screen and redraw everything.
+    ClearScreen,
+    Quit,
 }
 
 /// A window showing one file.
@@ -71,6 +101,8 @@ struct Pane {
     offset: usize,
     /// Area used for showing the lines when the window was last drawn.
     content_area: Cell<Rect>,
+    /// Index of the line containing the last search match, if any.
+    last_match: Option<usize>,
 }
 
 /// How to scroll a window.
@@ -103,12 +135,126 @@ impl App {
                 lines_read: 0,
                 offset: 0,
                 content_area: Cell::default(),
+                last_match: None,
             })
             .collect();
         Self {
             panes,
             status: config.status,
             focus: 0,
+            prompt: None,
+            search: None,
+            message: None,
+        }
+    }
+
+    /// Handles a terminal event.
+    fn handle_event(&mut self, event: &TermEvent) -> Response {
+        let TermEvent::Key(key) = event else {
+            return match action(event) {
+                Some(Action::Resized) => Response::Redraw,
+                _ => Response::Nothing,
+            };
+        };
+        if key.kind != KeyEventKind::Press {
+            return Response::Nothing;
+        }
+
+        // Any key press makes the message disappear.
+        let had_message = self.message.take().is_some();
+
+        if self.prompt.is_some() {
+            self.edit_prompt(key);
+            return Response::Redraw;
+        }
+
+        match action(event) {
+            Some(Action::Quit) => return Response::Quit,
+            Some(Action::Redraw) => return Response::ClearScreen,
+            Some(Action::Scroll(scroll)) => self.scroll(scroll),
+            Some(Action::Focus { forward }) => self.move_focus(forward),
+            Some(Action::StartSearch) => self.prompt = Some(String::new()),
+            Some(Action::FindNext { older }) => self.find(older),
+            Some(Action::Cancel) => self.search = None,
+            Some(Action::Resized) => {}
+            None if had_message => {}
+            None => return Response::Nothing,
+        }
+        Response::Redraw
+    }
+
+    /// Handles a key press while the search prompt is shown.
+    fn edit_prompt(&mut self, key: &KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => self.prompt = None,
+            KeyCode::Char('c') if ctrl => self.prompt = None,
+            KeyCode::Enter => {
+                let pattern = self.prompt.take().unwrap_or_default();
+                self.start_search(pattern);
+            }
+            KeyCode::Backspace => {
+                // As in vi, erasing everything cancels the search.
+                if let Some(prompt) = &mut self.prompt
+                    && prompt.pop().is_none()
+                {
+                    self.prompt = None;
+                }
+            }
+            KeyCode::Char(c) if !ctrl => {
+                if let Some(prompt) = &mut self.prompt {
+                    prompt.push(c);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Starts searching for the given pattern, or repeats the last search if
+    /// it's empty, from the bottom of the focused window towards the older
+    /// lines.
+    fn start_search(&mut self, pattern: String) {
+        if !pattern.is_empty() {
+            // Use "smart case": the search is case-insensitive unless the
+            // pattern contains upper case letters.
+            let case_insensitive = !pattern.chars().any(char::is_uppercase);
+            match RegexBuilder::new(&pattern)
+                .case_insensitive(case_insensitive)
+                .build()
+            {
+                Ok(regex) => self.search = Some(Search { pattern, regex }),
+                Err(e) => {
+                    // The error messages span several lines, the last one
+                    // explaining the problem.
+                    let e = e.to_string();
+                    let reason = e.lines().last().unwrap_or_default();
+                    let reason = reason.strip_prefix("error: ").unwrap_or(reason);
+                    self.message = Some(format!("invalid regex: {reason}"));
+                    return;
+                }
+            }
+        } else if self.search.is_none() {
+            return;
+        }
+
+        if let Some(pane) = self.panes.get_mut(self.focus) {
+            pane.last_match = None;
+        }
+        self.find(true);
+    }
+
+    /// Finds the next match of the current search in the focused window,
+    /// looking at the older or the newer lines.
+    fn find(&mut self, older: bool) {
+        let Some(search) = &self.search else {
+            self.message = Some("no search pattern".to_owned());
+            return;
+        };
+        let Some(pane) = self.panes.get_mut(self.focus) else {
+            return;
+        };
+        if !pane.find(&search.regex, older) {
+            self.message = Some(format!("pattern not found: {}", search.pattern));
         }
     }
 
@@ -154,9 +300,54 @@ impl App {
         });
         let areas = Layout::vertical(constraints).split(frame.area());
         let several = self.panes.len() > 1;
+        let regex = self.search.as_ref().map(|search| &search.regex);
         for (index, (pane, area)) in self.panes.iter().zip(areas.iter()).enumerate() {
             let focused = several && index == self.focus;
-            pane.draw(*area, frame.buffer_mut(), &self.status, focused);
+            pane.draw(*area, frame.buffer_mut(), &self.status, focused, regex);
+        }
+
+        // Show the prompt or the message in the status line of the focused
+        // window, instead of the status itself.
+        let text = match (&self.prompt, &self.message) {
+            (Some(prompt), _) => format!("/{prompt}"),
+            (None, Some(message)) => message.clone(),
+            (None, None) => return,
+        };
+        let Some(area) = areas.get(self.focus) else {
+            return;
+        };
+        if area.is_empty() {
+            return;
+        }
+        let status = Rect {
+            y: area.bottom() - 1,
+            height: 1,
+            ..*area
+        };
+        let style = if several {
+            FOCUSED_STATUS_STYLE
+        } else {
+            STATUS_STYLE
+        };
+        // Erase the status line drawn by the window before.
+        frame.render_widget(Clear, status);
+        frame.buffer_mut().set_style(status, style);
+
+        // Process the text as it can contain anything typed by the user.
+        let line = line::process(text.as_bytes(), &Scheme::default());
+        if let Some(row) = first_row(&line, status.width) {
+            draw_row(
+                &row,
+                status.x,
+                status.y,
+                status.width,
+                frame.buffer_mut(),
+                style,
+            );
+            if self.prompt.is_some() {
+                let x = status.x + row_width(Some(&row));
+                frame.set_cursor_position((x.min(status.right() - 1), status.y));
+            }
         }
     }
 }
@@ -245,8 +436,45 @@ impl Pane {
 
         while self.lines.len() > self.scrollback {
             self.lines.pop_front();
+            self.last_match = self.last_match.and_then(|index| index.checked_sub(1));
         }
         self.offset = self.offset.min(self.line_count().saturating_sub(1));
+    }
+
+    /// Finds the next line matching the regex, older or newer than the line
+    /// with the last match or, if there is none, than the bottom line of the
+    /// view, which is included in the search for the older lines.
+    ///
+    /// If a match is found, scrolls to show it at the bottom of the window,
+    /// if possible, and returns true.
+    fn find(&mut self, regex: &Regex, older: bool) -> bool {
+        // The incomplete line is never searched.
+        let Some(last) = self.lines.len().checked_sub(1) else {
+            return false;
+        };
+        let bottom = self
+            .line_count()
+            .saturating_sub(1 + self.effective_offset(self.content_area.get()))
+            .min(last);
+
+        let is_match = |index: &usize| {
+            self.lines
+                .get(*index)
+                .is_some_and(|line| regex.is_match(line.text()))
+        };
+        let found = match (older, self.last_match) {
+            (true, Some(index)) => (0..index).rev().find(is_match),
+            (true, None) => (0..=bottom).rev().find(is_match),
+            (false, Some(index)) => (index + 1..=last).find(is_match),
+            (false, None) => (bottom + 1..=last).find(is_match),
+        };
+
+        let Some(index) = found else {
+            return false;
+        };
+        self.last_match = Some(index);
+        self.offset = self.line_count() - 1 - index;
+        true
     }
 
     /// Returns the number of rows taken by the line with the given index,
@@ -303,6 +531,9 @@ impl Pane {
     }
 
     fn scroll(&mut self, scroll: Scroll) {
+        // Search from the new position after scrolling.
+        self.last_match = None;
+
         let area = self.content_area.get();
         let offset = self.effective_offset(area);
 
@@ -319,17 +550,25 @@ impl Pane {
         self.offset = offset.min(self.max_offset(area));
     }
 
-    fn draw(&self, area: Rect, buf: &mut Buffer, format: &StatusFormat, focused: bool) {
+    fn draw(
+        &self,
+        area: Rect,
+        buf: &mut Buffer,
+        format: &StatusFormat,
+        focused: bool,
+        search: Option<&Regex>,
+    ) {
         let [content, status] =
             Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(area);
         self.content_area.set(content);
         let offset = self.effective_offset(content);
-        self.draw_lines(content, buf, offset);
+        self.draw_lines(content, buf, offset, search);
         self.draw_status(status, buf, format, offset, focused);
     }
 
-    /// Draws the lines with the given offset, the last one at the bottom.
-    fn draw_lines(&self, area: Rect, buf: &mut Buffer, offset: usize) {
+    /// Draws the lines with the given offset, the last one at the bottom,
+    /// highlighting the matches of the search regex, if any.
+    fn draw_lines(&self, area: Rect, buf: &mut Buffer, offset: usize, search: Option<&Regex>) {
         if area.is_empty() {
             return;
         }
@@ -348,6 +587,19 @@ impl Pane {
             .min(self.lines.len());
         let mut y = area.bottom();
         for line in partial.iter().chain(self.lines.range(..end).rev()) {
+            let highlighted;
+            let line = match search {
+                Some(regex) => {
+                    let matches: Vec<_> = regex
+                        .find_iter(line.text())
+                        .map(|m| m.range())
+                        .filter(|range| !range.is_empty())
+                        .collect();
+                    highlighted = line.highlighted(&matches, HIGHLIGHT_STYLE);
+                    &highlighted
+                }
+                None => line,
+            };
             for row in wrap::wrap(line, area.width).iter().rev() {
                 if y == area.top() {
                     return;
@@ -526,8 +778,14 @@ pub fn run(terminal: &mut DefaultTerminal, app: &mut App) -> anyhow::Result<()> 
                 // The files are polled at the next loop iteration anyhow.
                 Message::Files(Notification::Changed) => {}
                 Message::Files(Notification::Failed) => poll_interval = POLL_INTERVAL,
-                Message::Terminal(event) => match action(&event?) {
-                    Some(Action::Quit) => {
+                Message::Terminal(event) => match app.handle_event(&event?) {
+                    Response::Nothing => {}
+                    Response::Redraw => redraw = true,
+                    Response::ClearScreen => {
+                        clear(terminal)?;
+                        redraw = true;
+                    }
+                    Response::Quit => {
                         // As for the initial clearing above, leaving the
                         // alternate screen doesn't erase our output if the
                         // terminal doesn't support it, so do it ourselves
@@ -536,20 +794,6 @@ pub fn run(terminal: &mut DefaultTerminal, app: &mut App) -> anyhow::Result<()> 
                         terminal.set_cursor_position((0, 0))?;
                         return Ok(());
                     }
-                    Some(Action::Redraw) => {
-                        clear(terminal)?;
-                        redraw = true;
-                    }
-                    Some(Action::Resized) => redraw = true,
-                    Some(Action::Scroll(scroll)) => {
-                        app.scroll(scroll);
-                        redraw = true;
-                    }
-                    Some(Action::Focus { forward }) => {
-                        app.move_focus(forward);
-                        redraw = true;
-                    }
-                    None => {}
                 },
             }
             message = rx.try_recv().ok();
@@ -583,6 +827,14 @@ enum Action {
     Focus {
         forward: bool,
     },
+    /// Show the search prompt.
+    StartSearch,
+    /// Find the next match of the current search.
+    FindNext {
+        older: bool,
+    },
+    /// Stop highlighting the search matches.
+    Cancel,
 }
 
 fn action(event: &TermEvent) -> Option<Action> {
@@ -607,6 +859,10 @@ fn action(event: &TermEvent) -> Option<Action> {
         KeyCode::End => Some(Action::Scroll(Scroll::Bottom)),
         KeyCode::Tab => Some(Action::Focus { forward: true }),
         KeyCode::BackTab => Some(Action::Focus { forward: false }),
+        KeyCode::Char('/') => Some(Action::StartSearch),
+        KeyCode::Char('n') => Some(Action::FindNext { older: true }),
+        KeyCode::Char('N') => Some(Action::FindNext { older: false }),
+        KeyCode::Esc => Some(Action::Cancel),
         _ => None,
     }
 }
@@ -1124,6 +1380,226 @@ style = "bold on blue"
         assert_eq!(fast, slow);
     }
 
+    fn press(app: &mut App, code: KeyCode) -> Response {
+        app.handle_event(&TermEvent::Key(KeyEvent::new(code, KeyModifiers::NONE)))
+    }
+
+    fn type_text(app: &mut App, text: &str) {
+        for c in text.chars() {
+            press(app, KeyCode::Char(c));
+        }
+    }
+
+    fn search(app: &mut App, pattern: &str) {
+        press(app, KeyCode::Char('/'));
+        type_text(app, pattern);
+        press(app, KeyCode::Enter);
+    }
+
+    /// Lines used by the search tests: with 3 rows, the last 3 are shown.
+    const SEARCH_LINES: [&str; 6] = ["foo", "bar", "foo bar", "baz", "qux", "Foo"];
+
+    #[test]
+    fn search_and_navigate() {
+        let mut app = scrollable_app(&SEARCH_LINES, 100);
+        assert_eq!(
+            render(&app, 8, 4),
+            ["baz     ", "qux     ", "Foo     ", "        "]
+        );
+
+        // The search is case-insensitive and includes the bottom line.
+        search(&mut app, "foo");
+        assert_eq!(
+            render(&app, 8, 4),
+            ["baz     ", "qux     ", "Foo     ", "        "]
+        );
+
+        // The next older match is shown at the bottom.
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(
+            render(&app, 8, 4),
+            ["foo     ", "bar     ", "foo bar ", "\u{2191}3      "]
+        );
+
+        // The oldest match can't be shown at the bottom, but is visible.
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(
+            render(&app, 8, 4),
+            ["foo     ", "bar     ", "foo bar ", "\u{2191}3      "]
+        );
+        assert_eq!(app.panes[0].last_match, Some(0));
+
+        // And there are no more matches.
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(render(&app, 25, 4)[3], "pattern not found: foo   ");
+        assert_eq!(app.panes[0].last_match, Some(0));
+
+        // Going in the other direction.
+        press(&mut app, KeyCode::Char('N'));
+        assert_eq!(app.panes[0].last_match, Some(2));
+        press(&mut app, KeyCode::Char('N'));
+        assert_eq!(app.panes[0].last_match, Some(5));
+        assert_eq!(
+            render(&app, 8, 4),
+            ["baz     ", "qux     ", "Foo     ", "        "]
+        );
+        press(&mut app, KeyCode::Char('N'));
+        assert_eq!(render(&app, 25, 4)[3], "pattern not found: foo   ");
+    }
+
+    #[test]
+    fn search_smart_case() {
+        let mut app = scrollable_app(&SEARCH_LINES, 100);
+        render(&app, 8, 4);
+        search(&mut app, "Foo");
+        assert_eq!(app.panes[0].last_match, Some(5));
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(app.panes[0].last_match, Some(5));
+        assert_eq!(app.message.as_deref(), Some("pattern not found: Foo"));
+    }
+
+    #[test]
+    fn search_from_scrolled_view() {
+        let mut app = scrollable_app(&SEARCH_LINES, 100);
+        render(&app, 8, 4);
+        press(&mut app, KeyCode::Up);
+        press(&mut app, KeyCode::Up);
+        render(&app, 8, 4);
+
+        // The search starts from the bottom of the view, i.e. "baz".
+        search(&mut app, "ba");
+        assert_eq!(app.panes[0].last_match, Some(3));
+
+        // Scrolling makes the next search start from the view again.
+        search(&mut app, "foo");
+        assert_eq!(app.panes[0].last_match, Some(2));
+        press(&mut app, KeyCode::End);
+        render(&app, 8, 4);
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(app.panes[0].last_match, Some(5));
+    }
+
+    #[test]
+    fn search_highlighting() {
+        let mut app = scrollable_app(&SEARCH_LINES, 100);
+        render(&app, 8, 4);
+        search(&mut app, "a");
+
+        let mut terminal = Terminal::new(TestBackend::new(8, 4)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let buf = terminal.backend().buffer();
+        let highlighted = |x: u16, y: u16| buf[(x, y)].bg == Color::Yellow;
+        // "baz" is shown in the first row.
+        assert_eq!(
+            [highlighted(0, 0), highlighted(1, 0), highlighted(2, 0)],
+            [false, true, false]
+        );
+        assert!(!highlighted(0, 1));
+
+        // Esc stops highlighting.
+        assert_eq!(press(&mut app, KeyCode::Esc), Response::Redraw);
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        assert_ne!(terminal.backend().buffer()[(1, 0)].bg, Color::Yellow);
+    }
+
+    #[test]
+    fn search_prompt() {
+        let mut app = scrollable_app(&SEARCH_LINES, 100);
+        render(&app, 8, 4);
+
+        press(&mut app, KeyCode::Char('/'));
+        type_text(&mut app, "bax");
+        press(&mut app, KeyCode::Backspace);
+        assert_eq!(render(&app, 8, 4)[3], "/ba     ");
+
+        // Keys normally doing something else are just typed.
+        type_text(&mut app, "qn/");
+        assert_eq!(app.prompt.as_deref(), Some("baqn/"));
+
+        // Esc and Ctrl-C cancel the search, without quitting.
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.prompt, None);
+        assert!(app.search.is_none());
+        press(&mut app, KeyCode::Char('/'));
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(app.handle_event(&TermEvent::Key(ctrl_c)), Response::Redraw);
+        assert_eq!(app.prompt, None);
+
+        // Erasing everything cancels too.
+        press(&mut app, KeyCode::Char('/'));
+        type_text(&mut app, "x");
+        press(&mut app, KeyCode::Backspace);
+        assert_eq!(app.prompt.as_deref(), Some(""));
+        press(&mut app, KeyCode::Backspace);
+        assert_eq!(app.prompt, None);
+    }
+
+    #[test]
+    fn prompt_and_message_replace_status() {
+        let mut app = make_app(&[("long_file_name", None)], 100);
+        add_lines(&mut app, 0, &["foo"]);
+        assert_eq!(render(&app, 12, 2)[1], " long_file_n");
+
+        press(&mut app, KeyCode::Char('/'));
+        type_text(&mut app, "ba");
+        assert_eq!(render(&app, 12, 2)[1], "/ba         ");
+
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(render(&app, 22, 2)[1], "pattern not found: ba ");
+
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(render(&app, 12, 2)[1], " long_file_n");
+    }
+
+    #[test]
+    fn search_repeated_with_empty_pattern() {
+        let mut app = scrollable_app(&SEARCH_LINES, 100);
+        render(&app, 8, 4);
+
+        // Nothing to repeat yet.
+        search(&mut app, "");
+        assert!(app.search.is_none());
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(app.message.as_deref(), Some("no search pattern"));
+
+        search(&mut app, "bar");
+        assert_eq!(app.panes[0].last_match, Some(2));
+        press(&mut app, KeyCode::End);
+        render(&app, 8, 4);
+        search(&mut app, "");
+        assert_eq!(app.panes[0].last_match, Some(2));
+    }
+
+    #[test]
+    fn search_errors() {
+        let mut app = scrollable_app(&SEARCH_LINES, 100);
+        render(&app, 8, 4);
+        search(&mut app, "(foo");
+        assert_eq!(
+            app.message.as_deref(),
+            Some("invalid regex: unclosed group")
+        );
+        assert_eq!(render(&app, 32, 4)[3], "invalid regex: unclosed group   ");
+
+        // Any key makes the message disappear.
+        assert_eq!(press(&mut app, KeyCode::Char('x')), Response::Redraw);
+        assert_eq!(app.message, None);
+        assert_eq!(press(&mut app, KeyCode::Char('x')), Response::Nothing);
+    }
+
+    #[test]
+    fn last_match_kept_when_lines_dropped() {
+        let mut app = scrollable_app(&SEARCH_LINES, 6);
+        render(&app, 8, 4);
+        search(&mut app, "foo bar");
+        assert_eq!(app.panes[0].last_match, Some(2));
+
+        add_lines(&mut app, 0, &["new 1", "new 2"]);
+        assert_eq!(app.panes[0].last_match, Some(0));
+        add_lines(&mut app, 0, &["new 3"]);
+        assert_eq!(app.panes[0].last_match, None);
+    }
+
     #[test]
     fn keys() {
         use ratatui::crossterm::event::{KeyEvent, KeyEventState};
@@ -1175,6 +1651,19 @@ style = "bold on blue"
             action(&key(KeyCode::BackTab, KeyModifiers::SHIFT)),
             Some(Action::Focus { forward: false })
         );
+        assert_eq!(
+            action(&key(KeyCode::Char('/'), none)),
+            Some(Action::StartSearch)
+        );
+        assert_eq!(
+            action(&key(KeyCode::Char('n'), none)),
+            Some(Action::FindNext { older: true })
+        );
+        assert_eq!(
+            action(&key(KeyCode::Char('N'), KeyModifiers::SHIFT)),
+            Some(Action::FindNext { older: false })
+        );
+        assert_eq!(action(&key(KeyCode::Esc, none)), Some(Action::Cancel));
         assert_eq!(action(&TermEvent::FocusGained), None);
     }
 }

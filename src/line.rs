@@ -84,17 +84,55 @@ impl Line {
         let start = self.text.len();
         self.text.push_str(s);
         let end = self.text.len();
-        if start == end {
+        self.push_span(start..end, style);
+    }
+
+    /// Adds a span for the given part of the text, which must follow the
+    /// last span, merging it with the last span if it has the same style.
+    fn push_span(&mut self, range: Range<usize>, style: Style) {
+        if range.is_empty() {
             return;
         }
 
         match self.spans.last_mut() {
-            Some(last) if last.style == style => last.range.end = end,
-            _ => self.spans.push(Span {
-                range: start..end,
-                style,
-            }),
+            Some(last) if last.style == style => last.range.end = range.end,
+            _ => self.spans.push(Span { range, style }),
         }
+    }
+
+    /// Returns a copy of this line with the given style applied on top of
+    /// the existing ones in the given parts of the text.
+    ///
+    /// The ranges must be sorted, non-overlapping and on character
+    /// boundaries, as the matches of a regex are.
+    pub fn highlighted(&self, ranges: &[Range<usize>], style: Style) -> Line {
+        let mut line = Line {
+            text: self.text.clone(),
+            spans: Vec::with_capacity(self.spans.len() + 2 * ranges.len()),
+        };
+
+        let mut ranges = ranges.iter().peekable();
+        for span in &self.spans {
+            let mut pos = span.range.start;
+            while let Some(range) = ranges.peek() {
+                if range.start >= span.range.end {
+                    break;
+                }
+                let start = range.start.max(pos);
+                let end = range.end.min(span.range.end);
+                line.push_span(pos..start, span.style);
+                line.push_span(start..end, span.style.patch(style));
+                pos = pos.max(end);
+                if range.end > span.range.end {
+                    // The range continues in the next span.
+                    break;
+                }
+                ranges.next();
+            }
+            line.push_span(pos..span.range.end, span.style);
+        }
+
+        line
     }
 }
 
@@ -565,6 +603,64 @@ mod tests {
         );
     }
 
+    #[test]
+    // Arrays of ranges here are lists of byte ranges, not ranges of numbers.
+    #[allow(clippy::single_range_in_vec_init)]
+    fn highlighted() {
+        const HL: Style = Style::new().bg(Color::Yellow);
+        let s = scheme(&[], &[("b+", false, "red")]);
+        let line = process(b"aabbbcc", &s);
+
+        let segments = |ranges: &[Range<usize>]| -> Vec<(String, Style)> {
+            line.highlighted(ranges, HL)
+                .segments()
+                .map(|(t, s)| (t.to_owned(), s))
+                .collect()
+        };
+        let seg = |t: &str, s: Style| (t.to_owned(), s);
+
+        assert_eq!(
+            segments(&[]),
+            [seg("aa", NONE), seg("bbb", RED), seg("cc", NONE)]
+        );
+        assert_eq!(
+            segments(&[0..1]),
+            [
+                seg("a", HL),
+                seg("a", NONE),
+                seg("bbb", RED),
+                seg("cc", NONE)
+            ]
+        );
+        // A range spanning several spans.
+        assert_eq!(
+            segments(&[1..6]),
+            [
+                seg("a", NONE),
+                seg("a", HL),
+                seg("bbb", RED.patch(HL)),
+                seg("c", HL),
+                seg("c", NONE)
+            ]
+        );
+        // Several ranges in the same span, and empty ranges.
+        assert_eq!(
+            segments(&[2..2, 2..3, 4..5, 7..7]),
+            [
+                seg("aa", NONE),
+                seg("b", RED.patch(HL)),
+                seg("b", RED),
+                seg("b", RED.patch(HL)),
+                seg("cc", NONE)
+            ]
+        );
+        // The whole line.
+        assert_eq!(
+            segments(&[0..7]),
+            [seg("aa", HL), seg("bbb", RED.patch(HL)), seg("cc", HL)]
+        );
+    }
+
     /// Schemes used by the property tests. None of them uses SPECIAL_STYLE,
     /// to be able to count the special text in the result.
     fn test_schemes() -> Vec<Scheme> {
@@ -590,7 +686,44 @@ mod tests {
         ]
     }
 
+    /// Returns the style of every byte of the line.
+    fn byte_styles(line: &Line) -> Vec<Style> {
+        line.spans()
+            .iter()
+            .flat_map(|span| std::iter::repeat_n(span.style, span.range.len()))
+            .collect()
+    }
+
     proptest! {
+        #[test]
+        fn highlighted_invariants(raw in raw_line(), n in 0..4usize) {
+            const HL: Style = Style::new().bg(Color::Yellow).add_modifier(Modifier::BOLD);
+            let s = scheme(&[], &[("[aeiou]+", false, "red"), (r"\\", false, "blue")]);
+            let line = process(&raw, &s);
+            let regex = regex::Regex::new(["x", "[a-z]+", ".", r"\s*"][n]).unwrap();
+            let ranges: Vec<_> = regex.find_iter(line.text()).map(|m| m.range()).collect();
+            let hl = line.highlighted(&ranges, HL);
+
+            prop_assert_eq!(hl.text(), line.text());
+            let mut pos = 0;
+            let mut prev_style = None;
+            for span in hl.spans() {
+                prop_assert_eq!(span.range.start, pos);
+                prop_assert!(!span.range.is_empty());
+                prop_assert_ne!(Some(span.style), prev_style);
+                pos = span.range.end;
+                prev_style = Some(span.style);
+            }
+            prop_assert_eq!(pos, line.text().len());
+
+            let before = byte_styles(&line);
+            let after = byte_styles(&hl);
+            for (i, (b, a)) in before.iter().zip(&after).enumerate() {
+                let expected = if ranges.iter().any(|r| r.contains(&i)) { b.patch(HL) } else { *b };
+                prop_assert_eq!(*a, expected, "at byte {}", i);
+            }
+        }
+
         #[test]
         fn process_invariants(raw in raw_line(), n in 0..4usize) {
             let schemes = test_schemes();
