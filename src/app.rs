@@ -46,6 +46,14 @@ const FOCUSED_STATUS_STYLE: Style = STATUS_STYLE.add_modifier(Modifier::BOLD);
 /// Style used for highlighting the search matches.
 const HIGHLIGHT_STYLE: Style = Style::new().fg(Color::Black).bg(Color::Yellow);
 
+/// Style used for highlighting the matches in the line found by the last
+/// search, as the next one starts from it.
+///
+/// Bold alone isn't enough, as black is often shown as dark grey when bold,
+/// which is not very different from black on a yellow background.
+const CURRENT_MATCH_STYLE: Style =
+    HIGHLIGHT_STYLE.add_modifier(Modifier::BOLD.union(Modifier::UNDERLINED));
+
 /// Marker appended to the parts of a too long line.
 const LONG_LINE_MARKER: &str = "\\";
 
@@ -300,10 +308,10 @@ impl App {
         });
         let areas = Layout::vertical(constraints).split(frame.area());
         let several = self.panes.len() > 1;
-        let regex = self.search.as_ref().map(|search| &search.regex);
         for (index, (pane, area)) in self.panes.iter().zip(areas.iter()).enumerate() {
             let focused = several && index == self.focus;
-            pane.draw(*area, frame.buffer_mut(), &self.status, focused, regex);
+            let search = self.search.as_ref();
+            pane.draw(*area, frame.buffer_mut(), &self.status, focused, search);
         }
 
         // Show the prompt or the message in the status line of the focused
@@ -556,14 +564,16 @@ impl Pane {
         buf: &mut Buffer,
         format: &StatusFormat,
         focused: bool,
-        search: Option<&Regex>,
+        search: Option<&Search>,
     ) {
         let [content, status] =
             Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(area);
         self.content_area.set(content);
         let offset = self.effective_offset(content);
-        self.draw_lines(content, buf, offset, search);
-        self.draw_status(status, buf, format, offset, focused);
+        let regex = search.map(|search| &search.regex);
+        self.draw_lines(content, buf, offset, regex);
+        let pattern = search.map(|search| search.pattern.as_str());
+        self.draw_status(status, buf, format, offset, focused, pattern);
     }
 
     /// Draws the lines with the given offset, the last one at the bottom,
@@ -586,7 +596,9 @@ impl Pane {
             .saturating_sub(offset)
             .min(self.lines.len());
         let mut y = area.bottom();
-        for line in partial.iter().chain(self.lines.range(..end).rev()) {
+        let lines = self.lines.range(..end).enumerate().rev();
+        let partial = partial.iter().map(|line| (None, line));
+        for (index, line) in partial.chain(lines.map(|(index, line)| (Some(index), line))) {
             let highlighted;
             let line = match search {
                 Some(regex) => {
@@ -595,7 +607,12 @@ impl Pane {
                         .map(|m| m.range())
                         .filter(|range| !range.is_empty())
                         .collect();
-                    highlighted = line.highlighted(&matches, HIGHLIGHT_STYLE);
+                    let style = if index.is_some() && index == self.last_match {
+                        CURRENT_MATCH_STYLE
+                    } else {
+                        HIGHLIGHT_STYLE
+                    };
+                    highlighted = line.highlighted(&matches, style);
                     &highlighted
                 }
                 None => line,
@@ -617,6 +634,7 @@ impl Pane {
         format: &StatusFormat,
         offset: usize,
         focused: bool,
+        search: Option<&str>,
     ) {
         if area.is_empty() {
             return;
@@ -626,6 +644,7 @@ impl Pane {
             path: self.follower.path(),
             lines: self.lines_read,
             scroll: offset,
+            search,
             size: self.follower.size(),
             modified: self.follower.modified(),
             status: self.follower.status(),
@@ -1489,12 +1508,36 @@ style = "bold on blue"
         terminal.draw(|frame| app.draw(frame)).unwrap();
         let buf = terminal.backend().buffer();
         let highlighted = |x: u16, y: u16| buf[(x, y)].bg == Color::Yellow;
-        // "baz" is shown in the first row.
+        // "baz" was found and is shown at the bottom, after "bar" and
+        // "foo bar".
+        assert_eq!(app.panes[0].last_match, Some(3));
         assert_eq!(
-            [highlighted(0, 0), highlighted(1, 0), highlighted(2, 0)],
+            [highlighted(0, 2), highlighted(1, 2), highlighted(2, 2)],
             [false, true, false]
         );
-        assert!(!highlighted(0, 1));
+        assert!(highlighted(1, 0) && !highlighted(0, 1));
+
+        // The matches in the line found by the search are shown differently.
+        let current = |x: u16, y: u16| buf[(x, y)].modifier.contains(Modifier::UNDERLINED);
+        assert!(current(1, 2) && !current(1, 0));
+        press(&mut app, KeyCode::Char('n'));
+        render(&app, 8, 4);
+        assert_eq!(app.panes[0].last_match, Some(2));
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let buf = terminal.backend().buffer();
+        // "foo bar" is now at the bottom, after "foo" and "bar".
+        let current = |x: u16, y: u16| buf[(x, y)].modifier.contains(Modifier::UNDERLINED);
+        let highlighted = |x: u16, y: u16| buf[(x, y)].bg == Color::Yellow;
+        assert!(highlighted(1, 1) && !current(1, 1));
+        assert!(highlighted(5, 2) && current(5, 2));
+
+        // There is no current match after scrolling.
+        press(&mut app, KeyCode::Up);
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let buf = terminal.backend().buffer();
+        assert!(
+            (0..8).all(|x| (0..3).all(|y| !buf[(x, y)].modifier.contains(Modifier::UNDERLINED)))
+        );
 
         // Esc stops highlighting.
         assert_eq!(press(&mut app, KeyCode::Esc), Response::Redraw);
@@ -1549,6 +1592,17 @@ style = "bold on blue"
 
         press(&mut app, KeyCode::Esc);
         assert_eq!(render(&app, 12, 2)[1], " long_file_n");
+    }
+
+    #[test]
+    fn search_pattern_in_status() {
+        let mut app = make_app_with_status(&[("f", None)], 100, ["[{search}]", "", ""]);
+        add_lines(&mut app, 0, &["foo"]);
+        assert_eq!(render(&app, 8, 2)[1], "[]      ");
+        search(&mut app, "o+");
+        assert_eq!(render(&app, 8, 2)[1], "[/o+]   ");
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(render(&app, 8, 2)[1], "[]      ");
     }
 
     #[test]
