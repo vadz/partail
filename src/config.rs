@@ -14,6 +14,7 @@ use anyhow::{Context, bail};
 use ratatui::style::Style;
 
 use crate::pattern::Pattern;
+use crate::status::{StatusFormat, Template};
 use crate::style;
 
 /// Number of lines kept in each window if not specified in the configuration.
@@ -25,6 +26,7 @@ pub struct Config {
     /// Maximal number of lines kept in each window.
     pub scrollback: NonZeroUsize,
     pub windows: Vec<Window>,
+    pub status: StatusFormat,
 }
 
 /// A window showing one file.
@@ -70,6 +72,15 @@ mod raw {
         pub window: Vec<Window>,
         #[serde(default)]
         pub scheme: BTreeMap<String, Scheme>,
+        pub status: Option<Status>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct Status {
+        pub left: Option<String>,
+        pub center: Option<String>,
+        pub right: Option<String>,
     }
 
     #[derive(Debug, Deserialize)]
@@ -112,6 +123,7 @@ impl Default for Config {
         Self {
             scrollback: DEFAULT_SCROLLBACK,
             windows: Vec::new(),
+            status: StatusFormat::default(),
         }
     }
 }
@@ -145,11 +157,30 @@ impl Config {
             })
             .collect::<anyhow::Result<_>>()?;
 
+        let status = match raw.status {
+            Some(status) => compile_status(status).context("status")?,
+            None => StatusFormat::default(),
+        };
+
         Ok(Self {
             scrollback: raw.scrollback.unwrap_or(DEFAULT_SCROLLBACK),
             windows,
+            status,
         })
     }
+}
+
+/// Compiles the status line format, using the default for the parts which
+/// are not specified.
+fn compile_status(raw: raw::Status) -> anyhow::Result<StatusFormat> {
+    let parse = |name, template: Option<String>, default| {
+        Template::parse(template.as_deref().unwrap_or(default)).context(name)
+    };
+    Ok(StatusFormat {
+        left: parse("left", raw.left, StatusFormat::DEFAULT_LEFT)?,
+        center: parse("center", raw.center, StatusFormat::DEFAULT_CENTER)?,
+        right: parse("right", raw.right, StatusFormat::DEFAULT_RIGHT)?,
+    })
 }
 
 fn compile_scheme(raw: raw::Scheme) -> anyhow::Result<Scheme> {
@@ -424,6 +455,24 @@ scheme = "s"
             "[scheme.s]\nstrip = [ { regex = 'a', groups = true } ]",
             "scheme \"s\": strip 1: \"groups = true\" requires",
         );
+    }
+
+    #[test]
+    fn status_format() {
+        let config = Config::parse("").unwrap();
+        assert_eq!(config.status, StatusFormat::default());
+
+        // Unspecified parts keep their defaults.
+        let config = Config::parse("[status]\nright = '{bytes}'\ncenter = ''").unwrap();
+        assert_eq!(config.status.left, StatusFormat::default().left);
+        assert_eq!(config.status.center, Template::parse("").unwrap());
+        assert_eq!(config.status.right, Template::parse("{bytes}").unwrap());
+
+        assert_err_contains(
+            "[status]\nleft = '{nope}'",
+            "status: left: unknown placeholder \"{nope}\"",
+        );
+        assert_err_contains("[status]\nmiddle = ''", "unknown field `middle`");
     }
 
     #[test]

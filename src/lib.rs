@@ -7,6 +7,7 @@ pub mod config;
 pub mod follow;
 pub mod line;
 pub mod pattern;
+pub mod status;
 pub mod style;
 pub mod wrap;
 

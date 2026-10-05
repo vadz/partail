@@ -2,7 +2,6 @@
 
 use std::collections::VecDeque;
 use std::num::NonZeroU16;
-use std::os::unix::ffi::OsStrExt;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,8 +13,9 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 
 use partail::config::{Config, Scheme};
-use partail::follow::{Event, Follower, Status};
+use partail::follow::{Event, Follower};
 use partail::line::{self, Line};
+use partail::status::{StatusFormat, Template, Values};
 use partail::wrap::{self, Row};
 
 /// How often the files are checked for changes.
@@ -30,6 +30,7 @@ const LONG_LINE_MARKER: &str = "\\";
 /// The whole application state.
 pub struct App {
     panes: Vec<Pane>,
+    status: StatusFormat,
 }
 
 /// A window showing one file.
@@ -41,6 +42,8 @@ struct Pane {
     lines: VecDeque<Line>,
     /// Maximal number of lines to keep.
     scrollback: usize,
+    /// Number of lines read since the start.
+    lines_read: u64,
 }
 
 impl App {
@@ -57,9 +60,13 @@ impl App {
                 height: window.height,
                 lines: VecDeque::new(),
                 scrollback: config.scrollback.get(),
+                lines_read: 0,
             })
             .collect();
-        Self { panes }
+        Self {
+            panes,
+            status: config.status,
+        }
     }
 
     /// Reads new data from all files. Returns true if there is more data to
@@ -83,7 +90,7 @@ impl App {
         });
         let areas = Layout::vertical(constraints).split(frame.area());
         for (pane, area) in self.panes.iter().zip(areas.iter()) {
-            pane.draw(*area, frame.buffer_mut());
+            pane.draw(*area, frame.buffer_mut(), &self.status);
         }
     }
 }
@@ -91,7 +98,10 @@ impl App {
 impl Pane {
     fn handle(&mut self, event: Event) {
         let line = match event {
-            Event::Line(bytes) => line::process(&bytes, &self.scheme),
+            Event::Line(bytes) => {
+                self.lines_read += 1;
+                line::process(&bytes, &self.scheme)
+            }
             Event::LongLinePart(bytes) => {
                 let mut line = line::process(&bytes, &self.scheme);
                 line.push_marker(LONG_LINE_MARKER);
@@ -107,11 +117,11 @@ impl Pane {
         }
     }
 
-    fn draw(&self, area: Rect, buf: &mut Buffer) {
+    fn draw(&self, area: Rect, buf: &mut Buffer, format: &StatusFormat) {
         let [content, status] =
             Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(area);
         self.draw_lines(content, buf);
-        self.draw_status(status, buf);
+        self.draw_status(status, buf, format);
     }
 
     /// Draws the most recent lines, the last one at the bottom.
@@ -136,31 +146,76 @@ impl Pane {
         }
     }
 
-    fn draw_status(&self, area: Rect, buf: &mut Buffer) {
+    fn draw_status(&self, area: Rect, buf: &mut Buffer, format: &StatusFormat) {
         if area.is_empty() {
             return;
         }
 
-        let mut text = b" ".to_vec();
-        text.extend_from_slice(self.follower.path().as_os_str().as_bytes());
-        if let Some(size) = self.follower.size() {
-            text.extend_from_slice(format!(" - {size} bytes").as_bytes());
-        }
-        match self.follower.status() {
-            Status::Following => {}
-            Status::Missing => text.extend_from_slice(b" - missing"),
-            Status::Error(e) => text.extend_from_slice(format!(" - error: {e}").as_bytes()),
-        }
-
-        // The file name and the error can contain anything, so process them
-        // like the file contents.
-        let line = line::process(&text, &Scheme::default());
+        let values = Values {
+            path: self.follower.path(),
+            lines: self.lines_read,
+            size: self.follower.size(),
+            modified: self.follower.modified(),
+            status: self.follower.status(),
+        };
 
         buf.set_style(area, STATUS_STYLE);
-        if let Some(row) = wrap::wrap(&line, area.width).first() {
-            draw_row(row, area.x, area.y, area.width, buf, STATUS_STYLE);
+
+        // The file name and the error message can contain anything, so
+        // process them like the file contents.
+        let process =
+            |template: &Template| line::process(&template.render(&values), &Scheme::default());
+        let (left, center, right) = (
+            process(&format.left),
+            process(&format.center),
+            process(&format.right),
+        );
+
+        // The right part, which is typically short and contains the most
+        // important information, is shown entirely if possible.
+        let width = area.width;
+        let right = first_row(&right, width);
+        let right_x = width.saturating_sub(row_width(right.as_ref()));
+
+        // The center part is centred if possible, but is moved to the left
+        // if it would overlap the right part and truncated if it doesn't fit
+        // before it at all.
+        let center = first_row(&center, right_x);
+        let center_width = row_width(center.as_ref());
+        let left_width = row_width(first_row(&left, width).as_ref());
+        let center_x = (width.saturating_sub(center_width) / 2)
+            .max(left_width)
+            .min(right_x.saturating_sub(center_width));
+
+        // And the left part gets whatever remains.
+        let left_end = if center_width > 0 { center_x } else { right_x };
+        let left = first_row(&left, left_end);
+
+        for (row, x) in [(left, 0), (center, center_x), (right, right_x)] {
+            if let Some(row) = row {
+                let x = area.x + x;
+                draw_row(
+                    &row,
+                    x,
+                    area.y,
+                    area.right().saturating_sub(x),
+                    buf,
+                    STATUS_STYLE,
+                );
+            }
         }
     }
+}
+
+/// Returns the first row of the line wrapped at the given width, i.e. its
+/// beginning which fits into this width, if anything fits.
+fn first_row(line: &Line, width: u16) -> Option<Row<'_>> {
+    wrap::wrap(line, width).into_iter().next()
+}
+
+/// Returns the width of the row, or 0 if there is none.
+fn row_width(row: Option<&Row>) -> u16 {
+    row.map_or(0, |row| row.width().try_into().unwrap_or(u16::MAX))
 }
 
 /// Draws the row at the given position, applying its styles on top of the
@@ -248,7 +303,19 @@ mod tests {
 
     /// Creates an application with windows for the given files, with the
     /// given heights, and with the given scrollback.
+    ///
+    /// The status lines show only the file name, preceded by a space.
     fn make_app(windows: &[(&str, Option<u16>)], scrollback: usize) -> App {
+        make_app_with_status(windows, scrollback, [" {file}", "", ""])
+    }
+
+    /// Creates an application with the given left, center and right parts of
+    /// the status line.
+    fn make_app_with_status(
+        windows: &[(&str, Option<u16>)],
+        scrollback: usize,
+        [left, center, right]: [&str; 3],
+    ) -> App {
         let config = Config {
             scrollback: scrollback.try_into().unwrap(),
             windows: windows
@@ -259,6 +326,11 @@ mod tests {
                     scheme: Arc::default(),
                 })
                 .collect(),
+            status: StatusFormat {
+                left: Template::parse(left).unwrap(),
+                center: Template::parse(center).unwrap(),
+                right: Template::parse(right).unwrap(),
+            },
         };
         App::new(config, 10)
     }
@@ -366,19 +438,48 @@ mod tests {
         let path = dir.path().join("log");
         std::fs::write(&path, "complete\nincomplete").unwrap();
 
-        let mut app = make_app(&[(path.to_str().unwrap(), None)], 100);
+        let format = [" {name}", "{status}", "{lines} lines, {bytes} bytes "];
+        let mut app = make_app_with_status(&[(path.to_str().unwrap(), None)], 100, format);
         assert!(!app.poll());
-        let screen = render(&app, 80, 3);
-        assert_eq!(screen[0].trim_end(), "complete");
-        assert_eq!(screen[1].trim_end(), "incomplete");
         assert_eq!(
-            screen[2].trim_end(),
-            format!(" {} - 19 bytes", path.display())
+            render(&app, 30, 3),
+            [
+                "complete                      ",
+                "incomplete                    ",
+                " log        1 lines, 19 bytes ",
+            ]
         );
 
-        let mut app = make_app(&[("/nonexistent/log", None)], 100);
+        let mut app = make_app_with_status(&[("/nonexistent/log", None)], 100, format);
         app.poll();
-        assert_eq!(render(&app, 30, 1), [" /nonexistent/log - missing   "]);
+        assert_eq!(render(&app, 30, 1), [" log  missing0 lines, - bytes "]);
+    }
+
+    #[test]
+    fn status_alignment() {
+        let app = make_app_with_status(&[("f", None)], 100, ["L{name}", "C", "{name}R"]);
+        assert_eq!(render(&app, 9, 1), ["Lf  C  fR"]);
+        assert_eq!(render(&app, 10, 1), ["Lf  C   fR"]);
+
+        // When there is not enough space, the parts don't overlap, but the
+        // center part is moved to the left and the left part is truncated,
+        // then the center one too.
+        let app = make_app_with_status(&[("f", None)], 100, ["left part", "center", "right"]);
+        assert_eq!(render(&app, 25, 1), ["left partcenter     right"]);
+        assert_eq!(render(&app, 20, 1), ["left partcenterright"]);
+        assert_eq!(render(&app, 15, 1), ["leftcenterright"]);
+        assert_eq!(render(&app, 10, 1), ["centeright"]);
+        assert_eq!(render(&app, 4, 1), ["righ"]);
+
+        // Empty parts don't take any space.
+        let app = make_app_with_status(&[("f", None)], 100, ["left part", "", "right"]);
+        assert_eq!(render(&app, 12, 1), ["left paright"]);
+    }
+
+    #[test]
+    fn status_sanitised() {
+        let app = make_app_with_status(&[("bad\x1bname", None)], 100, ["{file}", "", ""]);
+        assert_eq!(render(&app, 12, 1), ["bad^[name   "]);
     }
 
     #[test]
