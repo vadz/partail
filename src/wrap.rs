@@ -149,6 +149,73 @@ pub fn row_count(line: &Line, width: u16) -> usize {
     rows
 }
 
+/// Returns the width of the line in columns.
+pub fn width(line: &Line) -> usize {
+    let text = line.text();
+    if text.is_ascii() {
+        return text.len();
+    }
+    text.graphemes(true)
+        .map(|g| usize::from(g.cell_width()))
+        .sum()
+}
+
+/// Returns the column at which the text at the given byte offset in the line
+/// starts.
+pub fn column_at(line: &Line, offset: usize) -> usize {
+    let text = line.text();
+    if text.is_ascii() {
+        return offset.min(text.len());
+    }
+    text.grapheme_indices(true)
+        .take_while(|(start, _)| *start < offset)
+        .map(|(_, g)| usize::from(g.cell_width()))
+        .sum()
+}
+
+/// Returns the part of the line shown in the columns from `first` to
+/// `first + width`, without wrapping it.
+///
+/// The returned row is to be drawn after the returned number of blank
+/// columns, which is non-zero only if a wide character is partially before
+/// the first column, as such characters are omitted. Similarly, a wide
+/// character partially after the last column is omitted too.
+pub fn clip(line: &Line, first: usize, width: u16) -> (u16, Row<'_>) {
+    let text = line.text();
+    let end = first + usize::from(width);
+    let mut row = Row::new(text);
+
+    if text.is_ascii() {
+        let start = first.min(text.len());
+        let stop = end.min(text.len());
+        for span in line.spans() {
+            let range = span.range.start.max(start)..span.range.end.min(stop);
+            if !range.is_empty() {
+                row.segments.push((range, span.style));
+            }
+        }
+        row.width = stop - start;
+        return (0, row);
+    }
+
+    let mut indent = None;
+    let mut column = 0;
+    for (range, style, w) in graphemes(line) {
+        let next = column + w;
+        if next > end && w > 0 {
+            break;
+        }
+        if column >= first {
+            indent.get_or_insert(column - first);
+            row.push(range, style, w);
+        }
+        column = next;
+    }
+
+    let indent = indent.unwrap_or(0).try_into().unwrap_or(width);
+    (indent, row)
+}
+
 /// Returns true if a grapheme cluster of width `w` must be put on a new row
 /// rather than on the current one, already containing `row_width` columns.
 ///
@@ -313,7 +380,81 @@ mod tests {
         assert_eq!(widths(&plain("\u{2764}\u{FE0F}"), 10), [2]);
     }
 
+    /// Returns the indent and the text of the clipped line.
+    fn clipped(line: &Line, first: usize, width: u16) -> (u16, String) {
+        let (indent, row) = clip(line, first, width);
+        (indent, row.segments().map(|(s, _)| s).collect())
+    }
+
+    #[test]
+    fn widths_and_columns() {
+        let line = plain("ab日本e\u{301}c");
+        assert_eq!(width(&line), 8);
+        assert_eq!(column_at(&line, 0), 0);
+        assert_eq!(column_at(&line, 2), 2);
+        // After "日".
+        assert_eq!(column_at(&line, 5), 4);
+        // After "e" with its combining accent.
+        assert_eq!(column_at(&line, 11), 7);
+        assert_eq!(column_at(&line, line.text().len()), 8);
+
+        assert_eq!(width(&plain("abc")), 3);
+        assert_eq!(column_at(&plain("abc"), 2), 2);
+        assert_eq!(column_at(&plain("abc"), 10), 3);
+        assert_eq!(width(&plain("")), 0);
+    }
+
+    #[test]
+    fn clip_ascii() {
+        let s = scheme(&[], &[("c+", false, "red")]);
+        let line = process(b"abcccdef", &s);
+        assert_eq!(clipped(&line, 0, 3), (0, "abc".to_owned()));
+        assert_eq!(clipped(&line, 3, 3), (0, "ccd".to_owned()));
+        assert_eq!(clipped(&line, 6, 10), (0, "ef".to_owned()));
+        assert_eq!(clipped(&line, 8, 10), (0, String::new()));
+        assert_eq!(clipped(&line, 100, 10), (0, String::new()));
+
+        let (_, row) = clip(&line, 1, 4);
+        let segments: Vec<_> = row.segments().collect();
+        assert_eq!(segments, [("b", NONE), ("ccc", RED)]);
+        assert_eq!(row.width(), 4);
+    }
+
+    #[test]
+    fn clip_wide_characters() {
+        let line = plain("a日本b");
+        assert_eq!(clipped(&line, 0, 3), (0, "a日".to_owned()));
+        // The wide character partially after the end is omitted.
+        assert_eq!(clipped(&line, 0, 2), (0, "a".to_owned()));
+        // The wide character partially before the start is omitted too.
+        assert_eq!(clipped(&line, 2, 4), (1, "本b".to_owned()));
+        assert_eq!(clipped(&line, 3, 3), (0, "本b".to_owned()));
+        assert_eq!(clip(&line, 2, 4).1.width(), 3);
+    }
+
     proptest! {
+        #[test]
+        fn clip_invariants(raw in raw_line(), first in 0..30usize, width in 1..20u16) {
+            let line = process(&raw, &Scheme::default());
+            let (indent, row) = clip(&line, first, width);
+            prop_assert!(usize::from(indent) + row.width() <= usize::from(width));
+
+            // Drawing the row with ratatui takes exactly its width.
+            let mut buf = Buffer::empty(Rect::new(0, 0, width, 1));
+            let mut x = indent;
+            for (s, style) in row.segments() {
+                (x, _) = buf.set_stringn(x, 0, s, usize::from(width - x), style);
+            }
+            prop_assert_eq!(usize::from(x - indent), row.width());
+
+            // Clipping the whole line gives all of it.
+            let (indent, row) = clip(&line, 0, u16::MAX);
+            prop_assert_eq!(indent, 0);
+            prop_assert_eq!(row.width(), super::width(&line));
+            let all: String = row.segments().map(|(s, _)| s).collect();
+            prop_assert_eq!(all.as_str(), line.text());
+        }
+
         #[test]
         fn ascii_wrap_as_general(
             text in "[ -~]{0,100}",

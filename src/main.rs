@@ -71,6 +71,7 @@ fn load_config(cli: &Cli) -> anyhow::Result<Config> {
                 file: file.clone(),
                 height: None,
                 scheme: Arc::default(),
+                wrap: true,
             })
             .collect();
     }

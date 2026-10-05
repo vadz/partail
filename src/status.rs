@@ -34,7 +34,7 @@ pub struct StatusFormat {
 impl StatusFormat {
     pub const DEFAULT_LEFT: &str = "{file}";
     pub const DEFAULT_CENTER: &str = "{status} {search}";
-    pub const DEFAULT_RIGHT: &str = "{scroll} {lines}L {size:compact} {time}";
+    pub const DEFAULT_RIGHT: &str = "{scroll}{hscroll} {lines}L {size:compact} {time}";
 }
 
 impl Default for StatusFormat {
@@ -74,6 +74,8 @@ enum Part {
     Lines,
     /// Number of lines below the view, if scrolled.
     Scroll,
+    /// Number of columns before the view, if scrolled horizontally.
+    HScroll,
     /// The current search pattern, if any.
     Search,
     /// Size in human-readable units, compact or not.
@@ -94,6 +96,8 @@ pub struct Values<'a> {
     pub lines: u64,
     /// Number of lines below the view, 0 if following the end of the file.
     pub scroll: usize,
+    /// Number of columns to the left of the view, 0 if not scrolled.
+    pub hscroll: usize,
     /// The current search pattern, if any.
     pub search: Option<&'a str>,
     pub size: Option<u64>,
@@ -161,6 +165,11 @@ impl Template {
                     out.extend_from_slice(name.as_bytes());
                 }
                 Part::Lines => out.extend_from_slice(values.lines.to_string().as_bytes()),
+                Part::HScroll => {
+                    if values.hscroll > 0 {
+                        out.extend_from_slice(format!("\u{2192}{}", values.hscroll).as_bytes());
+                    }
+                }
                 Part::Search => {
                     if let Some(pattern) = values.search {
                         out.push(b'/');
@@ -216,6 +225,7 @@ fn parse_placeholder(placeholder: &str) -> Result<Part, TemplateError> {
         "name" => Part::Name,
         "lines" => Part::Lines,
         "scroll" => Part::Scroll,
+        "hscroll" => Part::HScroll,
         "search" => Part::Search,
         "size" => {
             let compact = match arg {
@@ -246,8 +256,8 @@ fn parse_placeholder(placeholder: &str) -> Result<Part, TemplateError> {
         _ => {
             return Err(TemplateError(format!(
                 "unknown placeholder \"{{{placeholder}}}\", expected one of {{file}}, {{name}}, \
-                 {{lines}}, {{scroll}}, {{search}}, {{size}}, {{bytes}}, {{time}} or \
-                 {{status}}"
+                 {{lines}}, {{scroll}}, {{hscroll}}, {{search}}, {{size}}, {{bytes}}, \
+                 {{time}} or {{status}}"
             )));
         }
     };
@@ -311,6 +321,7 @@ mod tests {
             path: Path::new("/var/log/syslog"),
             lines: 42,
             scroll: 0,
+            hscroll: 0,
             search: None,
             size: Some(1677),
             modified: None,
@@ -338,6 +349,9 @@ mod tests {
         assert_eq!(render("[{scroll}]", &v), "[]");
         let scrolled = Values { scroll: 123, ..v };
         assert_eq!(render("[{scroll}]", &scrolled), "[\u{2191}123]");
+        assert_eq!(render("[{hscroll}]", &v), "[]");
+        let hscrolled = Values { hscroll: 40, ..v };
+        assert_eq!(render("[{hscroll}]", &hscrolled), "[\u{2192}40]");
         assert_eq!(render("[{search}]", &v), "[]");
         let searching = Values {
             search: Some("fo+"),
@@ -397,7 +411,7 @@ mod tests {
         assert_eq!(
             parse_err("{nope}"),
             "unknown placeholder \"{nope}\", expected one of {file}, {name}, {lines}, \
-             {scroll}, {search}, {size}, {bytes}, {time} or {status}"
+             {scroll}, {hscroll}, {search}, {size}, {bytes}, {time} or {status}"
         );
         assert_eq!(parse_err("{file"), "unterminated placeholder \"{file\"");
         assert_eq!(

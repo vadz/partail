@@ -38,6 +38,8 @@ pub struct Window {
     pub height: Option<NonZeroU16>,
     /// Scheme to use, which is empty if the window doesn't specify any.
     pub scheme: Arc<Scheme>,
+    /// Whether long lines are wrapped initially or truncated.
+    pub wrap: bool,
 }
 
 /// How to process the lines of a window: first remove the parts matched by
@@ -89,6 +91,7 @@ mod raw {
         pub file: PathBuf,
         pub height: Option<NonZeroU16>,
         pub scheme: Option<String>,
+        pub wrap: Option<bool>,
     }
 
     #[derive(Debug, Deserialize)]
@@ -229,6 +232,7 @@ fn compile_window(
         file: raw.file,
         height: raw.height,
         scheme,
+        wrap: raw.wrap.unwrap_or(true),
     })
 }
 
@@ -301,6 +305,7 @@ scheme = "exim"
 
 [[window]]
 file = "plain.log"
+wrap = false
 
 [scheme.syslog]
 strip = [ { regex = '^(\S+ +\d+ )\S+( \S+)', groups = true } ]
@@ -355,7 +360,9 @@ strip = [ { regex = '^\S+ ' } ]
         assert!(!exim.scheme.strip[0].groups());
         assert!(exim.scheme.rules.is_empty());
 
+        assert!(config.windows[0].wrap);
         let plain = &config.windows[2];
+        assert!(!plain.wrap);
         assert!(plain.scheme.strip.is_empty());
         assert!(plain.scheme.rules.is_empty());
     }

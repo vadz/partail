@@ -128,6 +128,10 @@ struct Pane {
     content_area: Cell<Rect>,
     /// The last search match, if any.
     last_match: Option<Match>,
+    /// Whether long lines are wrapped or truncated.
+    wrap: bool,
+    /// Number of columns hidden to the left of the view if not wrapping.
+    hscroll: usize,
 }
 
 /// A search match.
@@ -170,6 +174,8 @@ impl App {
             .windows
             .into_iter()
             .map(|window| Pane {
+                wrap: window.wrap,
+                hscroll: 0,
                 follower: Follower::new(window.file, initial_lines),
                 scheme: window.scheme,
                 height: window.height,
@@ -216,6 +222,17 @@ impl App {
             Some(Action::Quit) => return Response::Quit,
             Some(Action::Redraw) => return Response::ClearScreen,
             Some(Action::Scroll(scroll)) => self.scroll(scroll),
+            Some(Action::ScrollHorizontally { right }) => {
+                if let Some(pane) = self.panes.get_mut(self.focus) {
+                    pane.scroll_horizontally(right);
+                }
+            }
+            Some(Action::ToggleWrap) => {
+                if let Some(pane) = self.panes.get_mut(self.focus) {
+                    pane.wrap = !pane.wrap;
+                    pane.hscroll = 0;
+                }
+            }
             Some(Action::Focus { forward }) => self.move_focus(forward),
             Some(Action::StartSearch) => self.prompt = Some(Prompt::default()),
             Some(Action::FindNext { older }) => self.find(older),
@@ -599,6 +616,20 @@ impl Pane {
             return false;
         };
         self.offset = self.line_count() - 1 - found.line;
+
+        // When not wrapping, make sure the match is visible, with some
+        // context before it.
+        if !self.wrap
+            && let Some(line) = self.lines.get(found.line)
+        {
+            let width = usize::from(self.content_area.get().width);
+            let start = wrap::column_at(line, found.range.start);
+            let end = wrap::column_at(line, found.range.end);
+            if start < self.hscroll || end > self.hscroll + width {
+                self.hscroll = start.saturating_sub(width / 4);
+            }
+        }
+
         self.last_match = Some(found);
         true
     }
@@ -614,6 +645,9 @@ impl Pane {
     /// which is the incomplete line if it's equal to the number of complete
     /// lines, when wrapped at the given width.
     fn rows(&self, index: usize, width: u16) -> usize {
+        if !self.wrap {
+            return 1;
+        }
         let rows = match self.lines.get(index) {
             Some(line) => wrap::row_count(line, width),
             None => self
@@ -683,6 +717,36 @@ impl Pane {
         self.offset = offset.min(self.max_offset(area));
     }
 
+    /// Scrolls horizontally by half of the window width, if not wrapping,
+    /// but not beyond the point where the longest visible line ends.
+    fn scroll_horizontally(&mut self, right: bool) {
+        if self.wrap {
+            return;
+        }
+
+        let area = self.content_area.get();
+        let step = usize::from(area.width / 2).max(1);
+        if !right {
+            self.hscroll = self.hscroll.saturating_sub(step);
+            return;
+        }
+
+        let offset = self.effective_offset(area);
+        let count = self.visible_lines(offset, area);
+        let Some(bottom) = self.line_count().checked_sub(offset + 1) else {
+            return;
+        };
+        let longest = (bottom + 1 - count..=bottom)
+            .map(|index| match self.lines.get(index) {
+                Some(line) => wrap::width(line),
+                None => self.partial_line().map_or(0, |line| wrap::width(&line)),
+            })
+            .max()
+            .unwrap_or(0);
+        let max = longest.saturating_sub(usize::from(area.width));
+        self.hscroll = (self.hscroll + step).min(max.max(self.hscroll));
+    }
+
     fn draw(
         &self,
         area: Rect,
@@ -740,6 +804,23 @@ impl Pane {
                 }
                 None => line,
             };
+            if !self.wrap {
+                if y == area.top() {
+                    return;
+                }
+                y -= 1;
+                let (indent, row) = wrap::clip(line, self.hscroll, area.width);
+                draw_row(
+                    &row,
+                    area.x + indent,
+                    y,
+                    area.width - indent,
+                    buf,
+                    Style::new(),
+                );
+                continue;
+            }
+
             for row in wrap::wrap(line, area.width).iter().rev() {
                 if y == area.top() {
                     return;
@@ -767,6 +848,7 @@ impl Pane {
             path: self.follower.path(),
             lines: self.lines_read,
             scroll: offset,
+            hscroll: if self.wrap { 0 } else { self.hscroll },
             search,
             size: self.follower.size(),
             modified: self.follower.modified(),
@@ -969,6 +1051,12 @@ enum Action {
     Focus {
         forward: bool,
     },
+    /// Scroll the focused window horizontally, if it doesn't wrap lines.
+    ScrollHorizontally {
+        right: bool,
+    },
+    /// Toggle wrapping long lines in the focused window.
+    ToggleWrap,
     /// Show the search prompt.
     StartSearch,
     /// Find the next match of the current search.
@@ -1001,6 +1089,9 @@ fn action(event: &TermEvent) -> Option<Action> {
         KeyCode::End => Some(Action::Scroll(Scroll::Bottom)),
         KeyCode::Tab => Some(Action::Focus { forward: true }),
         KeyCode::BackTab => Some(Action::Focus { forward: false }),
+        KeyCode::Left => Some(Action::ScrollHorizontally { right: false }),
+        KeyCode::Right => Some(Action::ScrollHorizontally { right: true }),
+        KeyCode::Char('w') => Some(Action::ToggleWrap),
         KeyCode::Char('/') => Some(Action::StartSearch),
         KeyCode::Char('n') => Some(Action::FindNext { older: true }),
         KeyCode::Char('N') => Some(Action::FindNext { older: false }),
@@ -1042,6 +1133,7 @@ mod tests {
                     file: PathBuf::from(file),
                     height: height.map(|h| h.try_into().unwrap()),
                     scheme: Arc::default(),
+                    wrap: true,
                 })
                 .collect(),
             status: StatusFormat {
@@ -1878,6 +1970,117 @@ style = "bold on blue"
         assert_eq!(prompt_text(&app), Some(""));
     }
 
+    /// Creates an application with a single window not wrapping the given
+    /// lines and showing the horizontal scroll position in its status line.
+    fn nowrap_app(lines: &[&str]) -> App {
+        let mut app = make_app_with_status(&[("f", None)], 100, ["{hscroll}", "", "{scroll}"]);
+        app.panes[0].wrap = false;
+        add_lines(&mut app, 0, lines);
+        app
+    }
+
+    #[test]
+    fn nowrap() {
+        let mut app = nowrap_app(&["abcdefghij", "12", "xyz123456789"]);
+        assert_eq!(render(&app, 5, 4), ["abcde", "12   ", "xyz12", "     "]);
+
+        // Scrolling by half of the width.
+        press(&mut app, KeyCode::Right);
+        assert_eq!(
+            render(&app, 5, 4),
+            ["cdefg", "     ", "z1234", "\u{2192}2   "]
+        );
+
+        // Up to the end of the longest line.
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Right);
+        assert_eq!(
+            render(&app, 5, 4),
+            ["hij  ", "     ", "56789", "\u{2192}7   "]
+        );
+        press(&mut app, KeyCode::Right);
+        assert_eq!(app.panes[0].hscroll, 7);
+
+        press(&mut app, KeyCode::Left);
+        assert_eq!(
+            render(&app, 5, 4),
+            ["fghij", "     ", "34567", "\u{2192}5   "]
+        );
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Left);
+        }
+        assert_eq!(render(&app, 5, 4), ["abcde", "12   ", "xyz12", "     "]);
+    }
+
+    #[test]
+    fn nowrap_toggle() {
+        let mut app = nowrap_app(&["abcdefghij", "12"]);
+        render(&app, 5, 4);
+        press(&mut app, KeyCode::Right);
+        assert_eq!(app.panes[0].hscroll, 2);
+
+        // Wrapping resets the horizontal scroll position.
+        press(&mut app, KeyCode::Char('w'));
+        assert_eq!(render(&app, 5, 4), ["abcde", "fghij", "12   ", "     "]);
+        assert_eq!(app.panes[0].hscroll, 0);
+
+        // Which can't be changed while wrapping.
+        press(&mut app, KeyCode::Right);
+        assert_eq!(app.panes[0].hscroll, 0);
+
+        press(&mut app, KeyCode::Char('w'));
+        assert_eq!(render(&app, 5, 4), ["     ", "abcde", "12   ", "     "]);
+    }
+
+    #[test]
+    fn nowrap_vertical_scrolling() {
+        let lines: Vec<String> = (1..=6).map(|n| format!("{n} {}", "x".repeat(20))).collect();
+        let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let mut app = nowrap_app(&lines);
+        assert_eq!(render(&app, 4, 4), ["4 xx", "5 xx", "6 xx", "    "]);
+        press(&mut app, KeyCode::Home);
+        assert_eq!(render(&app, 4, 4), ["1 xx", "2 xx", "3 xx", "  ↑3"]);
+    }
+
+    #[test]
+    fn nowrap_search_scrolls_horizontally() {
+        let line = format!("{} target", "a".repeat(20));
+        let mut app = nowrap_app(&[&line, "b"]);
+        render(&app, 10, 3);
+        search(&mut app, "target");
+        assert_eq!(app.panes[0].hscroll, 19);
+        assert_eq!(render(&app, 10, 3)[0], "a target  ");
+
+        // No horizontal scrolling if the match is already visible.
+        search(&mut app, "a t");
+        assert_eq!(app.panes[0].hscroll, 19);
+
+        // But there is if it's even partially hidden: the last "aa" is in
+        // the columns 18 and 19.
+        search(&mut app, "aa");
+        assert_eq!(app.panes[0].hscroll, 16);
+    }
+
+    #[test]
+    fn wrap_configured_per_window() {
+        let config = Config {
+            scrollback: 100.try_into().unwrap(),
+            windows: [true, false]
+                .map(|wrap| Window {
+                    file: PathBuf::from("f"),
+                    height: None,
+                    scheme: Arc::default(),
+                    wrap,
+                })
+                .into(),
+            status: StatusFormat::default(),
+        };
+        let app = App::new(config, 10);
+        assert!(app.panes[0].wrap);
+        assert!(!app.panes[1].wrap);
+    }
+
     #[test]
     fn search_errors() {
         let mut app = scrollable_app(&SEARCH_LINES, 100);
@@ -1972,6 +2175,18 @@ style = "bold on blue"
             Some(Action::FindNext { older: false })
         );
         assert_eq!(action(&key(KeyCode::Esc, none)), Some(Action::Cancel));
+        assert_eq!(
+            action(&key(KeyCode::Left, none)),
+            Some(Action::ScrollHorizontally { right: false })
+        );
+        assert_eq!(
+            action(&key(KeyCode::Right, none)),
+            Some(Action::ScrollHorizontally { right: true })
+        );
+        assert_eq!(
+            action(&key(KeyCode::Char('w'), none)),
+            Some(Action::ToggleWrap)
+        );
         assert_eq!(action(&TermEvent::FocusGained), None);
     }
 }
