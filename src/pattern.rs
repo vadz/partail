@@ -1,6 +1,7 @@
 //! Regex-based patterns used by both strip and colour rules.
 
 use std::fmt;
+use std::ops::Range;
 
 use regex::Regex;
 
@@ -62,9 +63,26 @@ impl Pattern {
     pub fn groups(&self) -> bool {
         self.groups
     }
+
+    /// Calls the given function with the byte range of every part of the
+    /// text selected by this pattern.
+    ///
+    /// All non-overlapping matches are used. If only groups are selected, the
+    /// groups which didn't participate in a match are skipped.
+    pub fn for_each_range(&self, text: &str, mut f: impl FnMut(Range<usize>)) {
+        if self.groups {
+            for caps in self.regex.captures_iter(text) {
+                caps.iter().skip(1).flatten().for_each(|m| f(m.range()));
+            }
+        } else {
+            self.regex.find_iter(text).for_each(|m| f(m.range()));
+        }
+    }
 }
 
 #[cfg(test)]
+// Arrays of ranges here are lists of byte ranges, not ranges of numbers.
+#[allow(clippy::single_range_in_vec_init)]
 mod tests {
     use super::*;
 
@@ -76,6 +94,37 @@ mod tests {
 
         assert!(!Pattern::new("abc", false).unwrap().groups());
         assert!(Pattern::new("a(b)c", false).is_ok());
+    }
+
+    fn ranges(regex: &str, groups: bool, text: &str) -> Vec<Range<usize>> {
+        let mut ranges = Vec::new();
+        Pattern::new(regex, groups)
+            .unwrap()
+            .for_each_range(text, |r| ranges.push(r));
+        ranges
+    }
+
+    #[test]
+    fn whole_matches() {
+        assert_eq!(ranges("b+", false, "abbcb"), [1..3, 4..5]);
+        assert!(ranges("x", false, "abc").is_empty());
+        assert_eq!(ranges("^.", false, "abc"), [0..1]);
+        // Groups don't matter if only whole matches are selected.
+        assert_eq!(ranges("a(b)", false, "abab"), [0..2, 2..4]);
+        // Empty matches are reported, but are harmless.
+        assert_eq!(ranges("x*", false, "ab"), [0..0, 1..1, 2..2]);
+    }
+
+    #[test]
+    fn group_matches() {
+        assert_eq!(ranges("(a)b(c)", true, "abcabc"), [0..1, 2..3, 3..4, 5..6]);
+        // Groups that don't participate are skipped, but later ones are not.
+        assert_eq!(ranges("(x)?(y)", true, "y"), [0..1]);
+        assert_eq!(ranges("(a)|(b)", true, "ab"), [0..1, 1..2]);
+        // Nested groups are all reported.
+        assert_eq!(ranges("((a)b)", true, "ab"), [0..2, 0..1]);
+        // Positions are in bytes.
+        assert_eq!(ranges("é(.)", true, "aéb"), [3..4]);
     }
 
     #[test]
