@@ -9,6 +9,7 @@ pub mod line;
 pub mod pattern;
 pub mod status;
 pub mod style;
+pub mod watch;
 pub mod wrap;
 
 #[cfg(test)]

@@ -2,9 +2,15 @@
 
 use std::cell::Cell;
 use std::collections::VecDeque;
+use std::io;
 use std::num::NonZeroU16;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::thread;
 use std::time::Duration;
+
+use anyhow::bail;
 
 use ratatui::DefaultTerminal;
 use ratatui::Frame;
@@ -17,10 +23,15 @@ use partail::config::{Config, Scheme};
 use partail::follow::{Event, Follower};
 use partail::line::{self, Line};
 use partail::status::{StatusFormat, Template, Values};
+use partail::watch::{self, Notification};
 use partail::wrap::{self, Row};
 
-/// How often the files are checked for changes.
+/// How often the files are checked for changes if they can't be watched.
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// How often the watched files are still checked for changes, in case some
+/// changes are not reported, as for the files on network file systems.
+const WATCHED_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Style of the status lines.
 const STATUS_STYLE: Style = Style::new().add_modifier(Modifier::REVERSED);
@@ -99,6 +110,11 @@ impl App {
             status: config.status,
             focus: 0,
         }
+    }
+
+    /// Returns the paths of all the followed files.
+    fn files(&self) -> impl Iterator<Item = &Path> {
+        self.panes.iter().map(|pane| pane.follower.path())
     }
 
     /// Scrolls the focused window.
@@ -447,12 +463,42 @@ fn draw_row(row: &Row, x: u16, y: u16, width: u16, buf: &mut Buffer, base: Style
     }
 }
 
+/// Messages sent to the event loop by the background threads.
+enum Message {
+    Terminal(io::Result<TermEvent>),
+    Files(Notification),
+}
+
 /// Runs the event loop until the user quits.
 pub fn run(terminal: &mut DefaultTerminal, app: &mut App) -> anyhow::Result<()> {
     // Only the non-blank cells are drawn initially, as the alternate screen
     // is supposed to be blank, but it isn't if the terminal doesn't support
     // it, as is the case of GNU screen by default, so clear it explicitly.
     clear(terminal)?;
+
+    // Wait for both the terminal events and the file change notifications
+    // by reading the former in a separate thread.
+    let (tx, rx) = mpsc::channel();
+    let terminal_tx = tx.clone();
+    thread::spawn(move || {
+        loop {
+            let event = event::read();
+            let failed = event.is_err();
+            if terminal_tx.send(Message::Terminal(event)).is_err() || failed {
+                break;
+            }
+        }
+    });
+
+    let files: Vec<PathBuf> = app.files().map(Path::to_path_buf).collect();
+    let watched = watch::watch(&files, move |notification| {
+        // This can only fail if we're exiting, so just ignore it.
+        let _ = tx.send(Message::Files(notification));
+    });
+    let mut poll_interval = match watched {
+        Ok(true) => WATCHED_POLL_INTERVAL,
+        Ok(false) | Err(_) => POLL_INTERVAL,
+    };
 
     // Drawing is relatively expensive, so only do it when needed.
     let mut redraw = true;
@@ -466,34 +512,47 @@ pub fn run(terminal: &mut DefaultTerminal, app: &mut App) -> anyhow::Result<()> 
         let timeout = if result.has_more {
             Duration::ZERO
         } else {
-            POLL_INTERVAL
+            poll_interval
         };
-        if event::poll(timeout)? {
-            match action(&event::read()?) {
-                Some(Action::Quit) => {
-                    // As for the initial clearing above, leaving the
-                    // alternate screen doesn't erase our output if the
-                    // terminal doesn't support it, so do it ourselves and,
-                    // as clear(1) does, put the cursor at the top.
-                    clear(terminal)?;
-                    terminal.set_cursor_position((0, 0))?;
-                    return Ok(());
-                }
-                Some(Action::Redraw) => {
-                    clear(terminal)?;
-                    redraw = true;
-                }
-                Some(Action::Resized) => redraw = true,
-                Some(Action::Scroll(scroll)) => {
-                    app.scroll(scroll);
-                    redraw = true;
-                }
-                Some(Action::Focus { forward }) => {
-                    app.move_focus(forward);
-                    redraw = true;
-                }
-                None => {}
+        let mut message = match rx.recv_timeout(timeout) {
+            Ok(message) => Some(message),
+            Err(RecvTimeoutError::Timeout) => None,
+            Err(RecvTimeoutError::Disconnected) => bail!("terminal events can't be read any more"),
+        };
+
+        // Handle all the pending messages before polling the files again.
+        while let Some(current) = message {
+            match current {
+                // The files are polled at the next loop iteration anyhow.
+                Message::Files(Notification::Changed) => {}
+                Message::Files(Notification::Failed) => poll_interval = POLL_INTERVAL,
+                Message::Terminal(event) => match action(&event?) {
+                    Some(Action::Quit) => {
+                        // As for the initial clearing above, leaving the
+                        // alternate screen doesn't erase our output if the
+                        // terminal doesn't support it, so do it ourselves
+                        // and, as clear(1) does, put the cursor at the top.
+                        clear(terminal)?;
+                        terminal.set_cursor_position((0, 0))?;
+                        return Ok(());
+                    }
+                    Some(Action::Redraw) => {
+                        clear(terminal)?;
+                        redraw = true;
+                    }
+                    Some(Action::Resized) => redraw = true,
+                    Some(Action::Scroll(scroll)) => {
+                        app.scroll(scroll);
+                        redraw = true;
+                    }
+                    Some(Action::Focus { forward }) => {
+                        app.move_focus(forward);
+                        redraw = true;
+                    }
+                    None => {}
+                },
             }
+            message = rx.try_recv().ok();
         }
     }
 }

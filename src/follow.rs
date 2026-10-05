@@ -83,6 +83,8 @@ pub struct Follower {
     modified: Option<SystemTime>,
     /// Total number of bytes read, only used for testing.
     bytes_read: u64,
+    /// Buffer used for reading, kept to avoid allocating it every time.
+    buf: Vec<u8>,
 }
 
 impl Follower {
@@ -103,6 +105,7 @@ impl Follower {
             size: None,
             modified: None,
             bytes_read: 0,
+            buf: Vec::new(),
         }
     }
 
@@ -162,14 +165,15 @@ impl Follower {
             return true;
         };
 
-        let mut buf = vec![0; READ_CHUNK];
+        let buf = &mut self.buf;
+        buf.resize(READ_CHUNK, 0);
         loop {
             if *budget == 0 {
                 return false;
             }
 
             let max = (*budget).min(READ_CHUNK) as u64;
-            match file.file.by_ref().take(max).read(&mut buf) {
+            match file.file.by_ref().take(max).read(buf) {
                 Ok(0) => return true,
                 Ok(n) => {
                     *budget = budget.saturating_sub(n);
