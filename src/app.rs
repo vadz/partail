@@ -176,6 +176,11 @@ fn draw_row(row: &Row, x: u16, y: u16, width: u16, buf: &mut Buffer, base: Style
 
 /// Runs the event loop until the user quits.
 pub fn run(terminal: &mut DefaultTerminal, app: &mut App) -> anyhow::Result<()> {
+    // Only the non-blank cells are drawn initially, as the alternate screen
+    // is supposed to be blank, but it isn't if the terminal doesn't support
+    // it, as is the case of GNU screen by default, so clear it explicitly.
+    terminal.clear()?;
+
     loop {
         let has_more = app.poll();
         terminal.draw(|frame| app.draw(frame))?;
@@ -185,23 +190,37 @@ pub fn run(terminal: &mut DefaultTerminal, app: &mut App) -> anyhow::Result<()> 
         } else {
             POLL_INTERVAL
         };
-        if event::poll(timeout)? && is_quit(&event::read()?) {
-            return Ok(());
+        if event::poll(timeout)? {
+            match action(&event::read()?) {
+                Some(Action::Quit) => return Ok(()),
+                Some(Action::Redraw) => terminal.clear()?,
+                None => {}
+            }
         }
     }
 }
 
-fn is_quit(event: &TermEvent) -> bool {
+/// Something the user asked for.
+#[derive(Debug, PartialEq, Eq)]
+enum Action {
+    Quit,
+    /// Redraw the entire screen, e.g. after something else wrote to it.
+    Redraw,
+}
+
+fn action(event: &TermEvent) -> Option<Action> {
     let TermEvent::Key(key) = event else {
-        return false;
+        return None;
     };
     if key.kind != KeyEventKind::Press {
-        return false;
+        return None;
     }
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     match key.code {
-        KeyCode::Char('q') => true,
-        KeyCode::Char('c') => key.modifiers.contains(KeyModifiers::CONTROL),
-        _ => false,
+        KeyCode::Char('q') => Some(Action::Quit),
+        KeyCode::Char('c') if ctrl => Some(Action::Quit),
+        KeyCode::Char('l') if ctrl => Some(Action::Redraw),
+        _ => None,
     }
 }
 
@@ -358,5 +377,33 @@ mod tests {
         for (width, height) in [(0, 0), (1, 1), (2, 1), (1, 2), (1, 5), (3, 3)] {
             render(&app, width, height);
         }
+    }
+
+    #[test]
+    fn keys() {
+        use ratatui::crossterm::event::{KeyEvent, KeyEventState};
+
+        let key = |code, modifiers| {
+            TermEvent::Key(KeyEvent {
+                code,
+                modifiers,
+                kind: KeyEventKind::Press,
+                state: KeyEventState::NONE,
+            })
+        };
+        let none = KeyModifiers::NONE;
+        let ctrl = KeyModifiers::CONTROL;
+
+        assert_eq!(action(&key(KeyCode::Char('q'), none)), Some(Action::Quit));
+        assert_eq!(action(&key(KeyCode::Char('c'), ctrl)), Some(Action::Quit));
+        assert_eq!(action(&key(KeyCode::Char('l'), ctrl)), Some(Action::Redraw));
+        assert_eq!(action(&key(KeyCode::Char('c'), none)), None);
+        assert_eq!(action(&key(KeyCode::Char('l'), none)), None);
+
+        let release = TermEvent::Key(KeyEvent {
+            kind: KeyEventKind::Release,
+            ..KeyEvent::new(KeyCode::Char('q'), none)
+        });
+        assert_eq!(action(&release), None);
     }
 }
