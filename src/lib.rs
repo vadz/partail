@@ -4,6 +4,7 @@
 //! configuration, line processing and file following.
 
 pub mod config;
+pub mod follow;
 pub mod line;
 pub mod pattern;
 pub mod style;

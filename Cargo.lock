@@ -936,10 +936,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "libc",
  "proptest",
  "ratatui",
  "regex",
  "serde",
+ "tempfile",
  "toml",
  "unicode-segmentation",
  "unicode-width",
