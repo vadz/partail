@@ -69,17 +69,14 @@ impl App {
         }
     }
 
-    /// Reads new data from all files. Returns true if there is more data to
-    /// read immediately.
-    fn poll(&mut self) -> bool {
-        let mut has_more = false;
+    /// Reads new data from all files.
+    fn poll(&mut self) -> PollResult {
+        let mut result = PollResult::default();
         for pane in &mut self.panes {
-            for event in pane.follower.poll() {
-                pane.handle(event);
-            }
-            has_more |= pane.follower.has_more();
+            result.changed |= pane.poll();
+            result.has_more |= pane.follower.has_more();
         }
-        has_more
+        result
     }
 
     fn draw(&self, frame: &mut Frame) {
@@ -95,7 +92,37 @@ impl App {
     }
 }
 
+/// The result of [`App::poll`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct PollResult {
+    /// True if anything shown on screen may have changed.
+    changed: bool,
+    /// True if there is more data to read immediately.
+    has_more: bool,
+}
+
 impl Pane {
+    /// Reads new data from the file and returns true if anything shown in
+    /// this window, including its status line, may have changed.
+    fn poll(&mut self) -> bool {
+        let state = |f: &Follower| {
+            (
+                f.status().clone(),
+                f.size(),
+                f.modified(),
+                f.partial().len(),
+            )
+        };
+
+        let before = state(&self.follower);
+        let events = self.follower.poll();
+        let changed = !events.is_empty() || state(&self.follower) != before;
+        for event in events {
+            self.handle(event);
+        }
+        changed
+    }
+
     fn handle(&mut self, event: Event) {
         let line = match event {
             Event::Line(bytes) => {
@@ -236,11 +263,16 @@ pub fn run(terminal: &mut DefaultTerminal, app: &mut App) -> anyhow::Result<()> 
     // it, as is the case of GNU screen by default, so clear it explicitly.
     clear(terminal)?;
 
+    // Drawing is relatively expensive, so only do it when needed.
+    let mut redraw = true;
     loop {
-        let has_more = app.poll();
-        terminal.draw(|frame| app.draw(frame))?;
+        let result = app.poll();
+        if result.changed || redraw {
+            terminal.draw(|frame| app.draw(frame))?;
+            redraw = false;
+        }
 
-        let timeout = if has_more {
+        let timeout = if result.has_more {
             Duration::ZERO
         } else {
             POLL_INTERVAL
@@ -256,7 +288,11 @@ pub fn run(terminal: &mut DefaultTerminal, app: &mut App) -> anyhow::Result<()> 
                     terminal.set_cursor_position((0, 0))?;
                     return Ok(());
                 }
-                Some(Action::Redraw) => clear(terminal)?,
+                Some(Action::Redraw) => {
+                    clear(terminal)?;
+                    redraw = true;
+                }
+                Some(Action::Resized) => redraw = true,
                 None => {}
             }
         }
@@ -281,11 +317,15 @@ enum Action {
     Quit,
     /// Redraw the entire screen, e.g. after something else wrote to it.
     Redraw,
+    /// The terminal size changed, so everything must be drawn again.
+    Resized,
 }
 
 fn action(event: &TermEvent) -> Option<Action> {
-    let TermEvent::Key(key) = event else {
-        return None;
+    let key = match event {
+        TermEvent::Key(key) => key,
+        TermEvent::Resize(..) => return Some(Action::Resized),
+        _ => return None,
     };
     if key.kind != KeyEventKind::Press {
         return None;
@@ -448,7 +488,7 @@ mod tests {
 
         let format = [" {name}", "{status}", "{lines} lines, {bytes} bytes "];
         let mut app = make_app_with_status(&[(path.to_str().unwrap(), None)], 100, format);
-        assert!(!app.poll());
+        assert!(!app.poll().has_more);
         assert_eq!(
             render(&app, 30, 3),
             [
@@ -461,6 +501,42 @@ mod tests {
         let mut app = make_app_with_status(&[("/nonexistent/log", None)], 100, format);
         app.poll();
         assert_eq!(render(&app, 30, 1), [" log  missing0 lines, - bytes "]);
+    }
+
+    #[test]
+    fn changes_detected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log");
+        std::fs::write(&path, "first\n").unwrap();
+
+        let mut app = make_app(&[(path.to_str().unwrap(), None)], 100);
+        assert!(app.poll().changed);
+        assert!(!app.poll().changed);
+
+        // A new line.
+        let append = |data: &[u8]| {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            f.write_all(data).unwrap();
+        };
+        append(b"second\n");
+        assert!(app.poll().changed);
+        assert!(!app.poll().changed);
+
+        // An incomplete line, then more of it.
+        append(b"par");
+        assert!(app.poll().changed);
+        append(b"tial");
+        assert!(app.poll().changed);
+        assert!(!app.poll().changed);
+
+        // The file disappearing changes its status.
+        std::fs::remove_file(&path).unwrap();
+        assert!(app.poll().changed);
+        assert!(!app.poll().changed);
     }
 
     #[test]
@@ -526,5 +602,7 @@ mod tests {
             ..KeyEvent::new(KeyCode::Char('q'), none)
         });
         assert_eq!(action(&release), None);
+        assert_eq!(action(&TermEvent::Resize(80, 24)), Some(Action::Resized));
+        assert_eq!(action(&TermEvent::FocusGained), None);
     }
 }
