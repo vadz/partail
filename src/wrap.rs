@@ -72,6 +72,44 @@ pub fn wrap(line: &Line, width: u16) -> Vec<Row<'_>> {
         return Vec::new();
     }
 
+    // Lines are almost always ASCII and wrapping them is much simpler.
+    if line.text().is_ascii() {
+        return wrap_ascii(line, width);
+    }
+    wrap_graphemes(line, width)
+}
+
+/// Implementation of [`wrap`] for ASCII lines: as the line text contains
+/// only printable characters, each of them is a grapheme cluster of width 1.
+fn wrap_ascii(line: &Line, width: usize) -> Vec<Row<'_>> {
+    let text = line.text();
+    if text.is_empty() {
+        return vec![Row::new(text)];
+    }
+
+    let mut rows = Vec::with_capacity(text.len().div_ceil(width));
+    let mut spans = line.spans().iter().peekable();
+    for start in (0..text.len()).step_by(width) {
+        let end = (start + width).min(text.len());
+        let mut row = Row::new(text);
+        while let Some(span) = spans.peek() {
+            let range = span.range.start.max(start)..span.range.end.min(end);
+            if !range.is_empty() {
+                row.segments.push((range, span.style));
+            }
+            if span.range.end > end {
+                break;
+            }
+            spans.next();
+        }
+        row.width = end - start;
+        rows.push(row);
+    }
+    rows
+}
+
+/// Implementation of [`wrap`] for any lines.
+fn wrap_graphemes(line: &Line, width: usize) -> Vec<Row<'_>> {
     let mut rows = Vec::new();
     let mut row = Row::new(line.text());
     for (range, style, w) in graphemes(line) {
@@ -90,6 +128,11 @@ pub fn row_count(line: &Line, width: u16) -> usize {
     let width = usize::from(width);
     if width == 0 {
         return 0;
+    }
+
+    let text = line.text();
+    if text.is_ascii() {
+        return text.len().div_ceil(width).max(1);
     }
 
     let mut rows = 1;
@@ -271,6 +314,16 @@ mod tests {
     }
 
     proptest! {
+        #[test]
+        fn ascii_wrap_as_general(
+            text in "[ -~]{0,100}",
+            width in 1..20usize,
+        ) {
+            let s = scheme(&[], &[("[aeiou]+", false, "red"), ("x.", false, "bold")]);
+            let line = process(text.as_bytes(), &s);
+            prop_assert_eq!(wrap_ascii(&line, width), wrap_graphemes(&line, width));
+        }
+
         #[test]
         fn wrap_invariants(raw in raw_line(), width in 1..20u16) {
             let s = scheme(

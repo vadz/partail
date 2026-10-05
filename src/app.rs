@@ -426,8 +426,24 @@ fn draw_row(row: &Row, x: u16, y: u16, width: u16, buf: &mut Buffer, base: Style
     let right = x.saturating_add(width);
     let mut x = x;
     for (text, style) in row.segments() {
-        let max = usize::from(right.saturating_sub(x));
-        (x, _) = buf.set_stringn(x, y, text, max, base.patch(style));
+        let style = base.patch(style);
+        if text.is_ascii() {
+            // This is much faster than set_stringn(), which splits the text
+            // into grapheme clusters, and is equivalent to it for ASCII
+            // text, which consists only of printable characters here.
+            for c in text.chars() {
+                if x >= right {
+                    break;
+                }
+                if let Some(cell) = buf.cell_mut((x, y)) {
+                    cell.set_char(c).set_style(style);
+                }
+                x += 1;
+            }
+        } else {
+            let max = usize::from(right.saturating_sub(x));
+            (x, _) = buf.set_stringn(x, y, text, max, style);
+        }
     }
 }
 
@@ -1011,6 +1027,42 @@ mod tests {
         for (width, height) in [(0, 0), (1, 1), (2, 1), (1, 2), (1, 5), (3, 3)] {
             render(&app, width, height);
         }
+    }
+
+    #[test]
+    fn ascii_drawn_as_by_ratatui() {
+        let config = Config::parse(
+            r#"
+[[window]]
+file = "f"
+scheme = "s"
+
+[[scheme.s.rule]]
+regex = '[aeiou]+'
+style = "red"
+
+[[scheme.s.rule]]
+regex = ','
+style = "bold on blue"
+"#,
+        )
+        .unwrap();
+        let line = line::process(
+            b"some text: with colours, and more",
+            &config.windows[0].scheme,
+        );
+        let mut fast = Buffer::empty(Rect::new(0, 0, 12, 4));
+        let mut slow = fast.clone();
+        for (y, row) in wrap::wrap(&line, 10).iter().enumerate() {
+            let y = y as u16;
+            draw_row(row, 1, y, 10, &mut fast, STATUS_STYLE);
+            let mut x = 1;
+            for (text, style) in row.segments() {
+                (x, _) =
+                    slow.set_stringn(x, y, text, usize::from(11 - x), STATUS_STYLE.patch(style));
+            }
+        }
+        assert_eq!(fast, slow);
     }
 
     #[test]
