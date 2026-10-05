@@ -107,6 +107,15 @@ mod raw {
     }
 }
 
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            scrollback: DEFAULT_SCROLLBACK,
+            windows: Vec::new(),
+        }
+    }
+}
+
 impl Config {
     /// Loads the configuration from the given file.
     pub fn load(path: &Path) -> anyhow::Result<Self> {

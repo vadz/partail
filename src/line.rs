@@ -62,6 +62,22 @@ impl Line {
             .map(|span| (self.text.get(span.range.clone()).unwrap_or(""), span.style))
     }
 
+    /// Creates a line consisting only of the given marker.
+    pub fn marker(text: &'static str) -> Self {
+        let mut line = Self::default();
+        line.push_marker(text);
+        line
+    }
+
+    /// Appends a marker, i.e. text not coming from the file, shown in the
+    /// same style as special text.
+    ///
+    /// The marker must consist of printable characters only.
+    pub fn push_marker(&mut self, text: &'static str) {
+        debug_assert!(text.chars().all(|c| escape(c).is_none() && c != '\t'));
+        self.push_str(text, SPECIAL_STYLE);
+    }
+
     /// Appends text with the given style, merging it with the last span if
     /// it has the same style.
     fn push_str(&mut self, s: &str, style: Style) {

@@ -1,6 +1,13 @@
 use std::path::PathBuf;
+use std::process::ExitCode;
+use std::sync::Arc;
 
+use anyhow::{Context, bail};
 use clap::Parser;
+
+use partail::config::{self, Config, Window};
+
+mod app;
 
 /// Follow several log files in parallel, colouring their lines with regex rules.
 #[derive(Debug, Parser)]
@@ -16,10 +23,73 @@ struct Cli {
     files: Vec<PathBuf>,
 }
 
-fn main() -> anyhow::Result<()> {
-    let _cli = Cli::parse();
+fn main() -> ExitCode {
+    match run(&Cli::parse()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("partail: {e:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
 
-    anyhow::bail!("not implemented yet")
+fn run(cli: &Cli) -> anyhow::Result<()> {
+    let config = load_config(cli)?;
+
+    let mut terminal = ratatui::try_init().context("failed to initialize the terminal")?;
+    let result = terminal
+        .size()
+        .map_err(anyhow::Error::from)
+        .and_then(|size| {
+            app::run(
+                &mut terminal,
+                &mut app::App::new(config, size.height.into()),
+            )
+        });
+    ratatui::restore();
+    result
+}
+
+/// Loads the configuration to use, taking the command line into account.
+fn load_config(cli: &Cli) -> anyhow::Result<Config> {
+    let default_path = config::default_path();
+    let path = match &cli.config {
+        Some(path) => Some(path.clone()),
+        None => default_path.clone().filter(|path| path.exists()),
+    };
+
+    let mut config = match &path {
+        Some(path) => Config::load(path)?,
+        None => Config::default(),
+    };
+
+    if !cli.files.is_empty() {
+        config.windows = cli
+            .files
+            .iter()
+            .map(|file| Window {
+                file: file.clone(),
+                height: None,
+                scheme: Arc::default(),
+            })
+            .collect();
+    }
+
+    if config.windows.is_empty() {
+        match (path, default_path) {
+            (Some(path), _) => bail!(
+                "nothing to follow: no files given and no windows defined in \"{}\"",
+                path.display()
+            ),
+            (None, Some(path)) => bail!(
+                "nothing to follow: no files given and no configuration file \"{}\"",
+                path.display()
+            ),
+            (None, None) => bail!("nothing to follow: no files given"),
+        }
+    }
+
+    Ok(config)
 }
 
 #[cfg(test)]
