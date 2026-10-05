@@ -265,23 +265,7 @@ mod tests {
     use ratatui::style::Color;
 
     use super::*;
-    use crate::style;
-
-    fn scheme(strip: &[(&str, bool)], rules: &[(&str, bool, &str)]) -> Scheme {
-        Scheme {
-            strip: strip
-                .iter()
-                .map(|&(regex, groups)| Pattern::new(regex, groups).unwrap())
-                .collect(),
-            rules: rules
-                .iter()
-                .map(|&(regex, groups, s)| Rule {
-                    pattern: Pattern::new(regex, groups).unwrap(),
-                    style: style::parse(s).unwrap(),
-                })
-                .collect(),
-        }
-    }
+    use crate::test_util::{raw_line, scheme};
 
     fn segments(line: &Line) -> Vec<(&str, Style)> {
         line.segments().collect()
@@ -588,20 +572,6 @@ mod tests {
                 ],
             ),
         ]
-    }
-
-    /// Generates raw lines likely to contain problematic bytes.
-    fn raw_line() -> impl Strategy<Value = Vec<u8>> {
-        let piece = prop_oneof![
-            any::<u8>().prop_map(|b| vec![b]),
-            any::<char>().prop_map(|c| c.to_string().into_bytes()),
-            prop::sample::select(vec![
-                "\t", "\x1b[31m", "\r", "\u{85}", "\u{202E}", "\u{200B}", "日本", "e\u{301}",
-                "\\x", " ", "ab",
-            ])
-            .prop_map(|s| s.as_bytes().to_vec()),
-        ];
-        prop::collection::vec(piece, 0..64).prop_map(|pieces| pieces.concat())
     }
 
     proptest! {

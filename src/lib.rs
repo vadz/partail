@@ -7,3 +7,7 @@ pub mod config;
 pub mod line;
 pub mod pattern;
 pub mod style;
+pub mod wrap;
+
+#[cfg(test)]
+mod test_util;

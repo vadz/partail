@@ -941,6 +941,7 @@ dependencies = [
  "regex",
  "serde",
  "toml",
+ "unicode-segmentation",
  "unicode-width",
 ]
 
