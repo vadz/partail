@@ -247,7 +247,15 @@ pub fn run(terminal: &mut DefaultTerminal, app: &mut App) -> anyhow::Result<()> 
         };
         if event::poll(timeout)? {
             match action(&event::read()?) {
-                Some(Action::Quit) => return Ok(()),
+                Some(Action::Quit) => {
+                    // As for the initial clearing above, leaving the
+                    // alternate screen doesn't erase our output if the
+                    // terminal doesn't support it, so do it ourselves and,
+                    // as clear(1) does, put the cursor at the top.
+                    clear(terminal)?;
+                    terminal.set_cursor_position((0, 0))?;
+                    return Ok(());
+                }
                 Some(Action::Redraw) => clear(terminal)?,
                 None => {}
             }
