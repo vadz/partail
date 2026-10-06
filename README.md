@@ -277,3 +277,8 @@ reading from them could block or never end.
   `partail` notices it, the truncation is not detected.
 - The terminal is not restored if `partail` is killed by a signal, use
   `reset` to fix it if this happens.
+
+
+## License
+
+`partail` is distributed under the [MIT license](LICENSE).
