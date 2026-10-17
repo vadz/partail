@@ -13,6 +13,7 @@ use std::sync::Arc;
 use anyhow::{Context, bail};
 use ratatui::style::Style;
 
+use crate::line::Escape;
 use crate::pattern::Pattern;
 use crate::status::{StatusFormat, Template};
 use crate::style;
@@ -27,6 +28,8 @@ pub struct Config {
     pub scrollback: NonZeroUsize,
     pub windows: Vec<Window>,
     pub status: StatusFormat,
+    /// Which characters are shown as escapes.
+    pub escape: Escape,
 }
 
 /// A window showing one file.
@@ -66,10 +69,13 @@ mod raw {
 
     use serde::Deserialize;
 
+    use crate::line::Escape;
+
     #[derive(Debug, Deserialize)]
     #[serde(deny_unknown_fields)]
     pub struct Config {
         pub scrollback: Option<NonZeroUsize>,
+        pub escape: Option<Escape>,
         #[serde(default)]
         pub window: Vec<Window>,
         #[serde(default)]
@@ -127,6 +133,7 @@ impl Default for Config {
             scrollback: DEFAULT_SCROLLBACK,
             windows: Vec::new(),
             status: StatusFormat::default(),
+            escape: Escape::default(),
         }
     }
 }
@@ -169,6 +176,7 @@ impl Config {
             scrollback: raw.scrollback.unwrap_or(DEFAULT_SCROLLBACK),
             windows,
             status,
+            escape: raw.escape.unwrap_or_default(),
         })
     }
 }
@@ -285,6 +293,7 @@ mod tests {
     fn empty() {
         let config = Config::parse("").unwrap();
         assert_eq!(config.scrollback, DEFAULT_SCROLLBACK);
+        assert_eq!(config.escape, Escape::Unprintable);
         assert!(config.windows.is_empty());
     }
 
@@ -293,6 +302,7 @@ mod tests {
         let config = Config::parse(
             r#"
 scrollback = 500
+escape = "non-bmp"
 
 [[window]]
 file = "/var/log/syslog"
@@ -332,6 +342,7 @@ strip = [ { regex = '^\S+ ' } ]
         .unwrap();
 
         assert_eq!(config.scrollback.get(), 500);
+        assert_eq!(config.escape, Escape::NonBmp);
         assert_eq!(config.windows.len(), 3);
 
         let syslog = &config.windows[0];
@@ -419,6 +430,8 @@ scheme = "s"
     fn invalid_values() {
         assert_err_contains("scrollback = 0", "nonzero");
         assert_err_contains("scrollback = -1", "scrollback");
+        assert_err_contains("escape = 'all'", "unknown variant `all`");
+        assert_err_contains("escape = 'non_bmp'", "unknown variant `non_bmp`");
         assert_err_contains("[[window]]\nfile = 'a'\nheight = 0", "nonzero");
         assert_err_contains("[[window]]\nfile = 'a'\nheight = 65536", "height");
         assert_err_contains(

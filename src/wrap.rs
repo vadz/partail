@@ -247,7 +247,7 @@ mod tests {
 
     use super::*;
     use crate::config::Scheme;
-    use crate::line::process;
+    use crate::line::{Escape, process};
     use crate::test_util::{raw_line, scheme};
 
     const NONE: Style = Style::new();
@@ -255,7 +255,7 @@ mod tests {
     const BLUE: Style = Style::new().fg(Color::Blue);
 
     fn plain(s: &str) -> Line {
-        process(s.as_bytes(), &Scheme::default())
+        process(s.as_bytes(), &Scheme::default(), Escape::Unprintable)
     }
 
     /// Returns the text of all rows.
@@ -306,7 +306,7 @@ mod tests {
     #[test]
     fn styles() {
         let s = scheme(&[], &[("B+", false, "red")]);
-        let line = process(b"aaBBBBcc", &s);
+        let line = process(b"aaBBBBcc", &s, Escape::Unprintable);
         let rows = wrap(&line, 3);
         let segments: Vec<Vec<_>> = rows.iter().map(|r| r.segments().collect()).collect();
         assert_eq!(
@@ -356,7 +356,7 @@ mod tests {
     fn cluster_uses_style_of_first_character() {
         // The rule colours the combining characters differently.
         let s = scheme(&[], &[(r"\p{M}", false, "blue"), ("e", false, "red")]);
-        let line = process("ae\u{301}b\u{301}".as_bytes(), &s);
+        let line = process("ae\u{301}b\u{301}".as_bytes(), &s, Escape::Unprintable);
         let rows = wrap(&line, 10);
         let segments: Vec<_> = rows[0].segments().collect();
         assert_eq!(
@@ -407,7 +407,7 @@ mod tests {
     #[test]
     fn clip_ascii() {
         let s = scheme(&[], &[("c+", false, "red")]);
-        let line = process(b"abcccdef", &s);
+        let line = process(b"abcccdef", &s, Escape::Unprintable);
         assert_eq!(clipped(&line, 0, 3), (0, "abc".to_owned()));
         assert_eq!(clipped(&line, 3, 3), (0, "ccd".to_owned()));
         assert_eq!(clipped(&line, 6, 10), (0, "ef".to_owned()));
@@ -435,7 +435,7 @@ mod tests {
     proptest! {
         #[test]
         fn clip_invariants(raw in raw_line(), first in 0..30usize, width in 1..20u16) {
-            let line = process(&raw, &Scheme::default());
+            let line = process(&raw, &Scheme::default(), Escape::Unprintable);
             let (indent, row) = clip(&line, first, width);
             prop_assert!(usize::from(indent) + row.width() <= usize::from(width));
 
@@ -461,7 +461,7 @@ mod tests {
             width in 1..20usize,
         ) {
             let s = scheme(&[], &[("[aeiou]+", false, "red"), ("x.", false, "bold")]);
-            let line = process(text.as_bytes(), &s);
+            let line = process(text.as_bytes(), &s, Escape::Unprintable);
             prop_assert_eq!(wrap_ascii(&line, width), wrap_graphemes(&line, width));
         }
 
@@ -476,7 +476,7 @@ mod tests {
                     (r"\\", false, "underline"),
                 ],
             );
-            let line = process(&raw, &s);
+            let line = process(&raw, &s, Escape::Unprintable);
             let rows = wrap(&line, width);
 
             prop_assert_eq!(rows.len(), row_count(&line, width));

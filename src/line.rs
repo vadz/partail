@@ -6,7 +6,8 @@
 //!    characters which can be shown as is. Invalid UTF-8, control characters
 //!    and invisible formatting characters are replaced with a visible
 //!    representation, called "special" text, which is always shown using
-//!    [`SPECIAL_STYLE`]. Tabs are kept for now.
+//!    [`SPECIAL_STYLE`]. Depending on [`Escape`], some printable characters
+//!    can be replaced too. Tabs are kept for now.
 //! 2. Stripping: the parts of the text matched by the scheme strip patterns
 //!    are removed, except for special text, which can't be removed.
 //! 3. Colouring: each character gets the style of the first rule of the
@@ -15,7 +16,10 @@
 
 use std::ops::Range;
 
+use ratatui::buffer::CellWidth;
 use ratatui::style::{Modifier, Style};
+use serde::Deserialize;
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthChar;
 
 use crate::config::{Rule, Scheme};
@@ -26,6 +30,23 @@ pub const SPECIAL_STYLE: Style = Style::new().add_modifier(Modifier::REVERSED);
 
 /// Tab stops are at every multiple of this number of columns.
 const TAB_WIDTH: usize = 8;
+
+/// Which characters are replaced with their representation as special text.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Escape {
+    /// Only the characters which can't be shown, i.e. control and format
+    /// characters.
+    #[default]
+    Unprintable,
+    /// Also all grapheme clusters taking more than one column, such as CJK
+    /// ideographs or emojis, for the terminals which don't agree with
+    /// ratatui about their width.
+    Wide,
+    /// Also all characters outside the Basic Multilingual Plane, such as most
+    /// emojis.
+    NonBmp,
+}
 
 /// A part of [`Line`] text with its style.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,8 +158,8 @@ impl Line {
 }
 
 /// Processes a raw line using the given scheme.
-pub fn process(raw: &[u8], scheme: &Scheme) -> Line {
-    let text = strip(sanitise(raw), &scheme.strip);
+pub fn process(raw: &[u8], scheme: &Scheme, escape: Escape) -> Line {
+    let text = strip(sanitise(raw, escape), &scheme.strip);
     let styles = colour(&text.text, &scheme.rules);
     build(&text, &styles)
 }
@@ -173,21 +194,46 @@ impl Marked {
     }
 }
 
-/// Converts raw bytes to text in which all characters can be shown as is.
-fn sanitise(raw: &[u8]) -> Marked {
+/// Converts raw bytes to text in which all characters can be shown as is,
+/// also replacing the printable characters selected by `escape`.
+fn sanitise(raw: &[u8], escape: Escape) -> Marked {
     let mut out = Marked::with_capacity(raw.len());
     for chunk in raw.utf8_chunks() {
-        for c in chunk.valid().chars() {
-            match escape(c) {
-                Some(escaped) => out.push_special(&escaped),
-                None => out.push(c, false),
+        let valid = chunk.valid();
+        match escape {
+            Escape::Unprintable => sanitise_str(&mut out, valid, |_| false),
+            Escape::Wide => {
+                for g in valid.graphemes(true) {
+                    // Control characters, which can't be passed to cell_width(),
+                    // are always clusters on their own (except for CRLF).
+                    let wide = !g.chars().any(char::is_control) && g.cell_width() > 1;
+                    sanitise_str(&mut out, g, |_| wide);
+                }
             }
+            Escape::NonBmp => sanitise_str(&mut out, valid, |c| c > '\u{FFFF}'),
         }
         for b in chunk.invalid() {
             out.push_special(&format!("\\x{b:02X}"));
         }
     }
     out
+}
+
+/// Appends the text replacing the characters which can't be shown as is and
+/// those for which `also_escape` returns true.
+fn sanitise_str(out: &mut Marked, text: &str, also_escape: impl Fn(char) -> bool) {
+    for c in text.chars() {
+        match escape(c) {
+            Some(escaped) => out.push_special(&escaped),
+            None if also_escape(c) => out.push_special(&hex_escape(c)),
+            None => out.push(c, false),
+        }
+    }
+}
+
+/// Returns the representation of a character as its hexadecimal code point.
+fn hex_escape(c: char) -> String {
+    format!("\\u{{{:X}}}", u32::from(c))
 }
 
 /// Returns the representation to use for a character which can't be shown as
@@ -200,7 +246,7 @@ fn escape(c: char) -> Option<String> {
         '\0'..='\x1f' => Some(format!("^{}", char::from(b'@' + c as u8))),
         '\x7f' => Some("^?".to_owned()),
         // Remaining control (i.e. C1) and format characters.
-        _ if c.is_control() || is_format(c) => Some(format!("\\u{{{:X}}}", u32::from(c))),
+        _ if c.is_control() || is_format(c) => Some(hex_escape(c)),
         _ => None,
     }
 }
@@ -327,7 +373,7 @@ mod tests {
 
     /// Processes the line without stripping nor colouring.
     fn plain(raw: &[u8]) -> Line {
-        process(raw, &Scheme::default())
+        process(raw, &Scheme::default(), Escape::Unprintable)
     }
 
     const NONE: Style = Style::new();
@@ -413,6 +459,44 @@ mod tests {
     }
 
     #[test]
+    fn escape_wide() {
+        let wide = |s: &str| process(s.as_bytes(), &Scheme::default(), Escape::Wide);
+
+        let line = wide("a日b");
+        assert_eq!(
+            segments(&line),
+            [("a", NONE), ("\\u{65E5}", SPECIAL_STYLE), ("b", NONE)]
+        );
+
+        // Characters outside the BMP can be narrow.
+        assert_eq!(wide("\u{1F600}\u{1D400}").text(), "\\u{1F600}\u{1D400}");
+        // Whole clusters taking two columns are escaped, even if all their
+        // characters are narrow.
+        assert_eq!(wide("\u{2764}\u{FE0F}").text(), "\\u{2764}\\u{FE0F}");
+        assert_eq!(wide("\u{1F1EB}\u{1F1F7}").text(), "\\u{1F1EB}\\u{1F1F7}");
+        // But not narrow clusters.
+        assert_eq!(wide("\u{2764}e\u{301}").text(), "\u{2764}e\u{301}");
+        // Unprintable characters are escaped as usual.
+        assert_eq!(wide("\x1b日").text(), "^[\\u{65E5}");
+    }
+
+    #[test]
+    fn escape_non_bmp() {
+        let non_bmp = |s: &str| process(s.as_bytes(), &Scheme::default(), Escape::NonBmp);
+
+        let line = non_bmp("a\u{1F600}b");
+        assert_eq!(
+            segments(&line),
+            [("a", NONE), ("\\u{1F600}", SPECIAL_STYLE), ("b", NONE)]
+        );
+
+        assert_eq!(non_bmp("\u{1D400}").text(), "\\u{1D400}");
+        assert_eq!(non_bmp("\u{1F1EB}\u{1F1F7}").text(), "\\u{1F1EB}\\u{1F1F7}");
+        // Characters in the BMP are kept, even if wide.
+        assert_eq!(non_bmp("日\u{2764}\u{FE0F}").text(), "日\u{2764}\u{FE0F}");
+    }
+
+    #[test]
     fn tabs() {
         assert_eq!(plain(b"\t").text(), " ".repeat(8));
         assert_eq!(plain(b"a\tb").text(), format!("a{}b", " ".repeat(7)));
@@ -431,12 +515,12 @@ mod tests {
     fn strip_whole_matches() {
         let s = scheme(&[(r"^\S+ ", false)], &[]);
         assert_eq!(
-            process(b"2026-10-04 02:11:37 msg", &s).text(),
+            process(b"2026-10-04 02:11:37 msg", &s, Escape::Unprintable).text(),
             "02:11:37 msg"
         );
 
         let s = scheme(&[("b", false)], &[]);
-        assert_eq!(process(b"abcbd", &s).text(), "acd");
+        assert_eq!(process(b"abcbd", &s, Escape::Unprintable).text(), "acd");
     }
 
     #[test]
@@ -444,32 +528,42 @@ mod tests {
         // The example from multitail configuration, replacing "-kr 0 7 -kr 15 22".
         let s = scheme(&[(r"^(\S+ +\d+ )\S+( \S+)", true)], &[]);
         assert_eq!(
-            process(b"Oct  4 02:11:37 host vmunix: segfault", &s).text(),
+            process(
+                b"Oct  4 02:11:37 host vmunix: segfault",
+                &s,
+                Escape::Unprintable
+            )
+            .text(),
             "02:11:37 vmunix: segfault"
         );
         assert_eq!(
-            process(b"Oct 14 02:11:37 otherhost CRON[1]: x", &s).text(),
+            process(
+                b"Oct 14 02:11:37 otherhost CRON[1]: x",
+                &s,
+                Escape::Unprintable
+            )
+            .text(),
             "02:11:37 CRON[1]: x"
         );
         // Lines not matching are unchanged.
-        assert_eq!(process(b"short", &s).text(), "short");
+        assert_eq!(process(b"short", &s, Escape::Unprintable).text(), "short");
     }
 
     #[test]
     fn strip_all_patterns_use_original_text() {
         // The second pattern wouldn't match if it were applied after the first.
         let s = scheme(&[("^a", false), ("^ab", false), ("d", false)], &[]);
-        assert_eq!(process(b"abcd", &s).text(), "c");
+        assert_eq!(process(b"abcd", &s, Escape::Unprintable).text(), "c");
 
         // Overlapping matches.
         let s = scheme(&[("abc", false), ("bcd", false)], &[]);
-        assert_eq!(process(b"abcde", &s).text(), "e");
+        assert_eq!(process(b"abcde", &s, Escape::Unprintable).text(), "e");
     }
 
     #[test]
     fn strip_everything() {
         let s = scheme(&[(".*", false)], &[]);
-        let line = process(b"anything", &s);
+        let line = process(b"anything", &s, Escape::Unprintable);
         assert_eq!(line.text(), "");
         assert!(line.spans().is_empty());
     }
@@ -477,32 +571,35 @@ mod tests {
     #[test]
     fn strip_empty_matches() {
         let s = scheme(&[("x*", false), ("^", false), ("$", false)], &[]);
-        assert_eq!(process(b"abc", &s).text(), "abc");
+        assert_eq!(process(b"abc", &s, Escape::Unprintable).text(), "abc");
     }
 
     #[test]
     fn strip_keeps_special_text() {
         // The pattern overlaps the start of "\xFF" only.
         let s = scheme(&[(r"^a\\", false)], &[]);
-        let line = process(b"a\xffb", &s);
+        let line = process(b"a\xffb", &s, Escape::Unprintable);
         assert_eq!(segments(&line), [("\\xFF", SPECIAL_STYLE), ("b", NONE)]);
 
         // The pattern covers special text entirely.
         let s = scheme(&[("^.*$", false)], &[]);
-        let line = process(b"a\x1bb\x07c", &s);
+        let line = process(b"a\x1bb\x07c", &s, Escape::Unprintable);
         assert_eq!(segments(&line), [("^[^G", SPECIAL_STYLE)]);
     }
 
     #[test]
     fn strip_then_expand_tabs() {
         let s = scheme(&[("^abc", false)], &[]);
-        assert_eq!(process(b"abc\tx", &s).text(), format!("{}x", " ".repeat(8)));
+        assert_eq!(
+            process(b"abc\tx", &s, Escape::Unprintable).text(),
+            format!("{}x", " ".repeat(8))
+        );
     }
 
     #[test]
     fn colour_whole_matches() {
         let s = scheme(&[], &[("b+", false, "red")]);
-        let line = process(b"abbcb", &s);
+        let line = process(b"abbcb", &s, Escape::Unprintable);
         assert_eq!(
             segments(&line),
             [("a", NONE), ("bb", RED), ("c", NONE), ("b", RED)]
@@ -512,7 +609,7 @@ mod tests {
     #[test]
     fn colour_groups() {
         let s = scheme(&[], &[("(a)b(c)", true, "red")]);
-        let line = process(b"xabcx", &s);
+        let line = process(b"xabcx", &s, Escape::Unprintable);
         assert_eq!(
             segments(&line),
             [
@@ -526,13 +623,16 @@ mod tests {
 
         // Groups not participating in the match are skipped.
         let s = scheme(&[], &[("(x)?(y)", true, "red")]);
-        assert_eq!(segments(&process(b"ay", &s)), [("a", NONE), ("y", RED)]);
+        assert_eq!(
+            segments(&process(b"ay", &s, Escape::Unprintable)),
+            [("a", NONE), ("y", RED)]
+        );
     }
 
     #[test]
     fn colour_first_rule_wins() {
         let s = scheme(&[], &[("b", false, "red"), ("abc", false, "blue")]);
-        let line = process(b"abcd", &s);
+        let line = process(b"abcd", &s, Escape::Unprintable);
         assert_eq!(
             segments(&line),
             [("a", BLUE), ("b", RED), ("c", BLUE), ("d", NONE)]
@@ -541,7 +641,7 @@ mod tests {
         // Later rules can't change anything already coloured.
         let s = scheme(&[], &[("abc", false, "blue"), ("b", false, "red")]);
         assert_eq!(
-            segments(&process(b"abcd", &s)),
+            segments(&process(b"abcd", &s, Escape::Unprintable)),
             [("abc", BLUE), ("d", NONE)]
         );
     }
@@ -552,9 +652,12 @@ mod tests {
             &[],
             &[("^.*rspamd.*$", false, ""), ("U=(\\S+)", true, "red")],
         );
-        assert_eq!(segments(&process(b"U=_rspamd", &s)), [("U=_rspamd", NONE)]);
         assert_eq!(
-            segments(&process(b"U=root", &s)),
+            segments(&process(b"U=_rspamd", &s, Escape::Unprintable)),
+            [("U=_rspamd", NONE)]
+        );
+        assert_eq!(
+            segments(&process(b"U=root", &s, Escape::Unprintable)),
             [("U=", NONE), ("root", RED)]
         );
     }
@@ -562,14 +665,17 @@ mod tests {
     #[test]
     fn colour_merges_adjacent_spans() {
         let s = scheme(&[], &[("a", false, "red"), ("b", false, "red")]);
-        assert_eq!(segments(&process(b"abc", &s)), [("ab", RED), ("c", NONE)]);
+        assert_eq!(
+            segments(&process(b"abc", &s, Escape::Unprintable)),
+            [("ab", RED), ("c", NONE)]
+        );
     }
 
     #[test]
     fn colour_after_strip() {
         let s = scheme(&[(r"^\S+ ", false)], &[(r"^(\S+)", true, "red")]);
         assert_eq!(
-            segments(&process(b"date time msg", &s)),
+            segments(&process(b"date time msg", &s, Escape::Unprintable)),
             [("time", RED), (" msg", NONE)]
         );
     }
@@ -577,7 +683,7 @@ mod tests {
     #[test]
     fn colour_special_text_overrides() {
         let s = scheme(&[], &[(".*", false, "red")]);
-        let line = process(b"a\x1bb", &s);
+        let line = process(b"a\x1bb", &s, Escape::Unprintable);
         assert_eq!(
             segments(&line),
             [("a", RED), ("^[", SPECIAL_STYLE), ("b", RED)]
@@ -587,7 +693,7 @@ mod tests {
     #[test]
     fn colour_tabs() {
         let s = scheme(&[], &[(r"\t", false, "red")]);
-        let line = process(b"a\tb", &s);
+        let line = process(b"a\tb", &s, Escape::Unprintable);
         assert_eq!(
             segments(&line),
             [("a", NONE), ("       ", RED), ("b", NONE)]
@@ -598,7 +704,7 @@ mod tests {
     fn colour_multibyte() {
         let s = scheme(&[], &[("(é)", true, "red")]);
         assert_eq!(
-            segments(&process("aéb".as_bytes(), &s)),
+            segments(&process("aéb".as_bytes(), &s, Escape::Unprintable)),
             [("a", NONE), ("é", RED), ("b", NONE)]
         );
     }
@@ -609,7 +715,7 @@ mod tests {
     fn highlighted() {
         const HL: Style = Style::new().bg(Color::Yellow);
         let s = scheme(&[], &[("b+", false, "red")]);
-        let line = process(b"aabbbcc", &s);
+        let line = process(b"aabbbcc", &s, Escape::Unprintable);
 
         let segments = |ranges: &[Range<usize>]| -> Vec<(String, Style)> {
             line.highlighted(ranges, HL)
@@ -699,7 +805,7 @@ mod tests {
         fn highlighted_invariants(raw in raw_line(), n in 0..4usize) {
             const HL: Style = Style::new().bg(Color::Yellow).add_modifier(Modifier::BOLD);
             let s = scheme(&[], &[("[aeiou]+", false, "red"), (r"\\", false, "blue")]);
-            let line = process(&raw, &s);
+            let line = process(&raw, &s, Escape::Unprintable);
             let regex = regex::Regex::new(["x", "[a-z]+", ".", r"\s*"][n]).unwrap();
             let ranges: Vec<_> = regex.find_iter(line.text()).map(|m| m.range()).collect();
             let hl = line.highlighted(&ranges, HL);
@@ -725,13 +831,25 @@ mod tests {
         }
 
         #[test]
-        fn process_invariants(raw in raw_line(), n in 0..4usize) {
+        fn process_invariants(
+            raw in raw_line(),
+            n in 0..4usize,
+            escape in prop::sample::select(&[Escape::Unprintable, Escape::Wide, Escape::NonBmp]),
+        ) {
             let schemes = test_schemes();
-            let line = process(&raw, &schemes[n]);
+            let line = process(&raw, &schemes[n], escape);
             let text = line.text();
 
             for c in text.chars() {
                 prop_assert!(!c.is_control() && !is_format(c), "{c:?} in {text:?}");
+                if escape == Escape::NonBmp {
+                    prop_assert!(c <= '\u{FFFF}', "{c:?} in {text:?}");
+                }
+            }
+            if escape == Escape::Wide {
+                for g in text.graphemes(true) {
+                    prop_assert!(g.cell_width() <= 1, "{g:?} in {text:?}");
+                }
             }
 
             let mut pos = 0;
@@ -746,7 +864,7 @@ mod tests {
             }
             prop_assert_eq!(pos, text.len());
 
-            let special_in = sanitise(&raw).special.iter().filter(|&&s| s).count();
+            let special_in = sanitise(&raw, escape).special.iter().filter(|&&s| s).count();
             let special_out: usize = line
                 .spans()
                 .iter()

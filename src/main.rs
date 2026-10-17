@@ -3,9 +3,10 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use anyhow::{Context, bail};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 
 use partail::config::{self, Config, Window};
+use partail::line::Escape;
 
 mod app;
 
@@ -17,10 +18,27 @@ struct Cli {
     #[arg(short, long, value_name = "CONFIG")]
     config: Option<PathBuf>,
 
+    /// Show these characters as hexadecimal escapes too, like the
+    /// unprintable ones, e.g. if the terminal disagrees about their width,
+    /// overriding the configuration file.
+    #[arg(long, value_name = "CHARS")]
+    escape: Option<EscapeArg>,
+
     /// Files to follow instead of the ones from the configuration, without
     /// colouring.
     #[arg(value_name = "FILE")]
     files: Vec<PathBuf>,
+}
+
+/// Printable characters which can be shown as escapes.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum EscapeArg {
+    /// No characters, only the unprintable ones are escaped.
+    Unprintable,
+    /// All characters taking two columns, e.g. CJK ideographs and emojis.
+    Wide,
+    /// Characters outside the Basic Multilingual Plane, e.g. most emojis.
+    NonBmp,
 }
 
 fn main() -> ExitCode {
@@ -62,6 +80,14 @@ fn load_config(cli: &Cli) -> anyhow::Result<Config> {
         Some(path) => Config::load(path)?,
         None => Config::default(),
     };
+
+    if let Some(escape) = cli.escape {
+        config.escape = match escape {
+            EscapeArg::Unprintable => Escape::Unprintable,
+            EscapeArg::Wide => Escape::Wide,
+            EscapeArg::NonBmp => Escape::NonBmp,
+        };
+    }
 
     if !cli.files.is_empty() {
         config.windows = cli

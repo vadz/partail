@@ -45,7 +45,7 @@ The binary is then `target/release/partail`.
 ## Usage
 
 ```
-partail [-c CONFIG] [FILE...]
+partail [-c CONFIG] [--escape unprintable|wide|non-bmp] [FILE...]
 ```
 
 Without arguments, `partail` shows the windows defined in its configuration
@@ -54,6 +54,17 @@ file, which is `$XDG_CONFIG_HOME/partail/config.toml`, i.e. usually
 
 Files given on the command line are shown instead of the windows from the
 configuration file, without any colouring, e.g. `partail a.log b.log`.
+
+`--escape` shows some printable characters as `\u{NNNN}`, in the same way
+as the invisible ones (see below): `wide` escapes all characters taking two
+columns, such as CJK ideographs or emojis, and `non-bmp` escapes all
+characters outside the Unicode Basic Multilingual Plane, which includes most
+emojis, while `unprintable`, the default, doesn't escape any printable
+characters. It overrides the `escape` option of the configuration file. This
+is useful when the terminal, or a terminal multiplexer such as `screen`,
+doesn't agree with `partail` about the width of these characters, resulting in
+garbled display. Note that the escapes, and not the original characters, are
+then seen by the scheme regexes and the search.
 
 When starting, only enough lines to fill the screen are read from the end of
 the existing files. Files created later are read entirely.
@@ -107,6 +118,10 @@ example showing all the available options:
 ```toml
 # Number of lines kept in memory for each window (default: 100000).
 scrollback = 100000
+
+# Printable characters shown as escapes, as with the --escape command line
+# option: "unprintable" (default, i.e. none), "wide" or "non-bmp".
+escape = "unprintable"
 
 # Windows are shown in the order in which they're defined.
 [[window]]
@@ -237,6 +252,9 @@ so `partail` never passes their contents to the terminal as is:
 - Invisible characters which can change how the surrounding text is shown,
   such as bidirectional text controls or zero-width spaces, are shown as
   `\u{NNNN}`.
+- Optionally, wide characters or characters outside the BMP are shown as
+  `\u{NNNN}` too, see the `--escape` option above and the `escape`
+  configuration option.
 
 This special text is shown in reverse video, which takes precedence over the
 colouring rules, and is never removed by the `strip` regexes.

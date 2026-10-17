@@ -26,7 +26,7 @@ use regex::{Regex, RegexBuilder};
 
 use partail::config::{Config, Scheme};
 use partail::follow::{Event, Follower};
-use partail::line::{self, Line};
+use partail::line::{self, Escape, Line};
 use partail::status::{StatusFormat, Template, Values};
 use partail::watch::{self, Notification};
 use partail::wrap::{self, Row};
@@ -62,6 +62,8 @@ const LONG_LINE_MARKER: &str = "\\";
 pub struct App {
     panes: Vec<Pane>,
     status: StatusFormat,
+    /// Which characters are shown as escapes in the status lines.
+    escape: Escape,
     /// Index of the window the scrolling keys apply to.
     focus: usize,
     /// The search prompt, if it's shown.
@@ -109,6 +111,7 @@ enum Response {
 struct Pane {
     follower: Follower,
     scheme: Arc<Scheme>,
+    escape: Escape,
     height: Option<NonZeroU16>,
     /// Lines read from the file, the most recent last.
     lines: VecDeque<Line>,
@@ -178,6 +181,7 @@ impl App {
                 hscroll: 0,
                 follower: Follower::new(window.file, initial_lines),
                 scheme: window.scheme,
+                escape: config.escape,
                 height: window.height,
                 lines: VecDeque::new(),
                 scrollback: config.scrollback.get(),
@@ -190,6 +194,7 @@ impl App {
         Self {
             panes,
             status: config.status,
+            escape: config.escape,
             focus: 0,
             prompt: None,
             history: Vec::new(),
@@ -452,7 +457,7 @@ impl App {
         frame.buffer_mut().set_style(status, style);
 
         // Process the text as it can contain anything typed by the user.
-        let line = line::process(text.as_bytes(), &Scheme::default());
+        let line = line::process(text.as_bytes(), &Scheme::default(), self.escape);
         if let Some(row) = first_row(&line, status.width) {
             draw_row(
                 &row,
@@ -527,17 +532,17 @@ impl Pane {
     /// Returns the incomplete last line processed for showing it, if any.
     fn partial_line(&self) -> Option<Line> {
         self.has_partial()
-            .then(|| line::process(self.follower.partial(), &self.scheme))
+            .then(|| line::process(self.follower.partial(), &self.scheme, self.escape))
     }
 
     fn handle(&mut self, event: Event) {
         let line = match event {
             Event::Line(bytes) => {
                 self.lines_read += 1;
-                line::process(&bytes, &self.scheme)
+                line::process(&bytes, &self.scheme, self.escape)
             }
             Event::LongLinePart(bytes) => {
-                let mut line = line::process(&bytes, &self.scheme);
+                let mut line = line::process(&bytes, &self.scheme, self.escape);
                 line.push_marker(LONG_LINE_MARKER);
                 line
             }
@@ -864,8 +869,9 @@ impl Pane {
 
         // The file name and the error message can contain anything, so
         // process them like the file contents.
-        let process =
-            |template: &Template| line::process(&template.render(&values), &Scheme::default());
+        let process = |template: &Template| {
+            line::process(&template.render(&values), &Scheme::default(), self.escape)
+        };
         let (left, center, right) = (
             process(&format.left),
             process(&format.center),
@@ -1141,6 +1147,7 @@ mod tests {
                 center: Template::parse(center).unwrap(),
                 right: Template::parse(right).unwrap(),
             },
+            escape: Escape::default(),
         };
         App::new(config, 10)
     }
@@ -1569,6 +1576,28 @@ mod tests {
     }
 
     #[test]
+    fn escape_wide() {
+        let config = Config {
+            scrollback: 100.try_into().unwrap(),
+            windows: vec![Window {
+                file: PathBuf::from("日"),
+                height: None,
+                scheme: Arc::default(),
+                wrap: true,
+            }],
+            status: StatusFormat {
+                left: Template::parse("{file}").unwrap(),
+                center: Template::parse("").unwrap(),
+                right: Template::parse("").unwrap(),
+            },
+            escape: Escape::Wide,
+        };
+        let mut app = App::new(config, 10);
+        add_lines(&mut app, 0, &["a日b"]);
+        assert_eq!(render(&app, 12, 2), ["a\\u{65E5}b  ", "\\u{65E5}    "]);
+    }
+
+    #[test]
     fn tiny_terminal() {
         let mut app = make_app(&[("a", Some(5)), ("b", None)], 100);
         add_lines(&mut app, 0, &["xyz", "\u{65e5}\u{672c}"]);
@@ -1599,6 +1628,7 @@ style = "bold on blue"
         let line = line::process(
             b"some text: with colours, and more",
             &config.windows[0].scheme,
+            Escape::Unprintable,
         );
         let mut fast = Buffer::empty(Rect::new(0, 0, 12, 4));
         let mut slow = fast.clone();
@@ -2075,6 +2105,7 @@ style = "bold on blue"
                 })
                 .into(),
             status: StatusFormat::default(),
+            escape: Escape::default(),
         };
         let app = App::new(config, 10);
         assert!(app.panes[0].wrap);
