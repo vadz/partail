@@ -261,8 +261,8 @@ colouring rules, and is never removed by the `strip` regexes.
 
 Lines longer than 64 KiB are split into several parts, the last character of
 all but the last part being a `\` shown in reverse video. Similarly,
-`--- file replaced ---` and `--- file truncated ---` lines are shown when the
-file is rotated.
+`--- file replaced ---` and `--- file truncated ---` lines, extended with
+dashes to the full width of the window, are shown when the file is rotated.
 
 Only regular files are followed: following a FIFO or a device is refused, as
 reading from them could block or never end.

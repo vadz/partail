@@ -65,6 +65,8 @@ pub struct Span {
 pub struct Line {
     text: String,
     spans: Vec<Span>,
+    /// Whether this is a separator, see [`Line::separator`].
+    separator: bool,
 }
 
 impl Line {
@@ -83,11 +85,50 @@ impl Line {
             .map(|span| (self.text.get(span.range.clone()).unwrap_or(""), span.style))
     }
 
-    /// Creates a line consisting only of the given marker.
-    pub fn marker(text: &'static str) -> Self {
-        let mut line = Self::default();
+    /// Creates a separator line, consisting of the given marker surrounded
+    /// by dashes, which can be extended to the full width of the window
+    /// using [`Line::filled`].
+    ///
+    /// The marker must consist of printable ASCII characters only.
+    pub fn separator(text: &'static str) -> Self {
+        debug_assert!(text.is_ascii());
+        let mut line = Self {
+            separator: true,
+            ..Self::default()
+        };
+        line.push_marker("--- ");
         line.push_marker(text);
+        line.push_marker(" ---");
         line
+    }
+
+    /// Returns this line extended to the given width by adding dashes on
+    /// both sides of it, so that its text is centred, if it is a separator
+    /// fitting into this width.
+    ///
+    /// The added dashes have the style of the first and last character of
+    /// the line respectively.
+    pub fn filled(&self, width: usize) -> Option<Line> {
+        if !self.separator {
+            return None;
+        }
+        // Separators are ASCII, so their width is just their length.
+        let extra = width.checked_sub(self.text.len())?;
+        let left = extra / 2;
+        let first = self.spans.first()?.style;
+        let last = self.spans.last()?.style;
+
+        let mut line = Line {
+            text: String::with_capacity(width),
+            spans: Vec::with_capacity(self.spans.len() + 2),
+            separator: true,
+        };
+        line.push_str(&"-".repeat(left), first);
+        for (text, style) in self.segments() {
+            line.push_str(text, style);
+        }
+        line.push_str(&"-".repeat(extra - left), last);
+        Some(line)
     }
 
     /// Appends a marker, i.e. text not coming from the file, shown in the
@@ -130,6 +171,7 @@ impl Line {
         let mut line = Line {
             text: self.text.clone(),
             spans: Vec::with_capacity(self.spans.len() + 2 * ranges.len()),
+            separator: self.separator,
         };
 
         let mut ranges = ranges.iter().peekable();
@@ -330,6 +372,7 @@ fn build(text: &Marked, styles: &[Option<&Style>]) -> Line {
     let mut line = Line {
         text: String::with_capacity(text.text.len()),
         spans: Vec::new(),
+        separator: false,
     };
 
     let mut column = 0;

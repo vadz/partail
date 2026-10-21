@@ -546,8 +546,8 @@ impl Pane {
                 line.push_marker(LONG_LINE_MARKER);
                 line
             }
-            Event::Replaced => Line::marker("--- file replaced ---"),
-            Event::Truncated => Line::marker("--- file truncated ---"),
+            Event::Replaced => Line::separator("file replaced"),
+            Event::Truncated => Line::separator("file truncated"),
         };
 
         self.lines.push_back(line);
@@ -809,12 +809,21 @@ impl Pane {
                 }
                 None => line,
             };
+
+            // Separators take the entire width of the window, if they fit
+            // into it, and are never scrolled horizontally.
+            let filled = line.filled(usize::from(area.width));
+            let (line, hscroll) = match &filled {
+                Some(filled) => (filled, 0),
+                None => (line, self.hscroll),
+            };
+
             if !self.wrap {
                 if y == area.top() {
                     return;
                 }
                 y -= 1;
-                let (indent, row) = wrap::clip(line, self.hscroll, area.width);
+                let (indent, row) = wrap::clip(line, hscroll, area.width);
                 draw_row(
                     &row,
                     area.x + indent,
@@ -1228,8 +1237,53 @@ mod tests {
                 "--- file truncated ---",
                 "long\\                 ",
                 "end                   ",
-                "--- file replaced --- ",
+                "--- file replaced ----",
                 " f                    ",
+            ]
+        );
+    }
+
+    #[test]
+    fn separators() {
+        let mut app = make_app(&[("f", None)], 100);
+        app.panes[0].handle(Event::Truncated);
+        add_lines(&mut app, 0, &["0123456789abcdefghijklmnopqrstuvwxyz"]);
+        app.panes[0].handle(Event::Replaced);
+        assert_eq!(
+            render(&app, 30, 5),
+            [
+                "------- file truncated -------",
+                "0123456789abcdefghijklmnopqrst",
+                "uvwxyz                        ",
+                "------- file replaced --------",
+                " f                            ",
+            ]
+        );
+
+        // Separators which don't fit are wrapped as usual.
+        assert_eq!(
+            render(&app, 20, 7),
+            [
+                "--- file truncated -",
+                "--                  ",
+                "0123456789abcdefghij",
+                "klmnopqrstuvwxyz    ",
+                "--- file replaced --",
+                "-                   ",
+                " f                  ",
+            ]
+        );
+
+        // And they are not scrolled horizontally.
+        app.panes[0].wrap = false;
+        app.panes[0].hscroll = 10;
+        assert_eq!(
+            render(&app, 30, 4),
+            [
+                "------- file truncated -------",
+                "abcdefghijklmnopqrstuvwxyz    ",
+                "------- file replaced --------",
+                " f                            ",
             ]
         );
     }
