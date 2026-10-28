@@ -115,16 +115,12 @@ mod raw {
     #[serde(deny_unknown_fields)]
     pub struct Strip {
         pub regex: String,
-        #[serde(default)]
-        pub groups: bool,
     }
 
     #[derive(Debug, Deserialize)]
     #[serde(deny_unknown_fields)]
     pub struct Rule {
         pub regex: String,
-        #[serde(default)]
-        pub groups: bool,
         pub style: String,
     }
 }
@@ -203,7 +199,7 @@ fn compile_scheme(raw: raw::Scheme) -> anyhow::Result<Scheme> {
         .strip
         .into_iter()
         .enumerate()
-        .map(|(n, s)| Pattern::new(&s.regex, s.groups).with_context(|| format!("strip {}", n + 1)))
+        .map(|(n, s)| compile_pattern(&s.regex).with_context(|| format!("strip {}", n + 1)))
         .collect::<anyhow::Result<_>>()?;
 
     let rules = raw
@@ -216,8 +212,12 @@ fn compile_scheme(raw: raw::Scheme) -> anyhow::Result<Scheme> {
     Ok(Scheme { strip, rules })
 }
 
+fn compile_pattern(regex: &str) -> anyhow::Result<Pattern> {
+    Pattern::new(regex).context("invalid regex")
+}
+
 fn compile_rule(raw: raw::Rule) -> anyhow::Result<Rule> {
-    let pattern = Pattern::new(&raw.regex, raw.groups)?;
+    let pattern = compile_pattern(&raw.regex)?;
     let style =
         style::parse(&raw.style).with_context(|| format!("invalid style \"{}\"", raw.style))?;
     Ok(Rule { pattern, style })
@@ -322,11 +322,10 @@ file = "plain.log"
 wrap = false
 
 [scheme.syslog]
-strip = [ { regex = '^(\S+ +\d+ )\S+( \S+)', groups = true } ]
+strip = [ { regex = '^(\S+ +\d+ )\S+( \S+)' } ]
 
 [[scheme.syslog.rule]]
 regex = 'vmunix: ([^:]*): segfault at'
-groups = true
 style = "red bold"
 
 [[scheme.syslog.rule]]
@@ -430,10 +429,7 @@ scheme = "s"
         assert_err_contains("[[window]]\nheight = 1", "missing field `file`");
         assert_err_contains("[[scheme.s.rule]]\nregex = 'a'", "missing field `style`");
         assert_err_contains("[[scheme.s.rule]]\nstyle = 'red'", "missing field `regex`");
-        assert_err_contains(
-            "[scheme.s]\nstrip = [ { groups = true } ]",
-            "missing field `regex`",
-        );
+        assert_err_contains("[scheme.s]\nstrip = [ {} ]", "missing field `regex`");
     }
 
     #[test]
@@ -470,10 +466,6 @@ scheme = "s"
         assert_eq!(err.matches("unclosed group").count(), 1, "{err}");
 
         assert_err_contains(
-            "[[scheme.s.rule]]\nregex = 'a'\ngroups = true\nstyle = ''",
-            "scheme \"s\": rule 1: \"groups = true\" requires a regex with capture groups",
-        );
-        assert_err_contains(
             "[[scheme.s.rule]]\nregex = 'a'\nstyle = 'purple bold'",
             "scheme \"s\": rule 1: invalid style \"purple bold\": unknown word \"purple\"",
         );
@@ -481,9 +473,10 @@ scheme = "s"
             "[scheme.s]\nstrip = [ { regex = 'a' }, { regex = '[' } ]",
             "scheme \"s\": strip 2: invalid regex: ",
         );
+        // The option for selecting the groups doesn't exist any more.
         assert_err_contains(
-            "[scheme.s]\nstrip = [ { regex = 'a', groups = true } ]",
-            "scheme \"s\": strip 1: \"groups = true\" requires",
+            "[scheme.s]\nstrip = [ { regex = '(a)', groups = true } ]",
+            "unknown field `groups`",
         );
     }
 

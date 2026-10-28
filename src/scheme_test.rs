@@ -148,7 +148,6 @@ style = "bold"
 
 [[scheme.s.rule]]
 regex = '(a)(x)?'
-groups = true
 style = ""
 "#;
 

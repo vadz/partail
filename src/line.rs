@@ -635,20 +635,20 @@ mod tests {
 
     #[test]
     fn strip_whole_matches() {
-        let s = scheme(&[(r"^\S+ ", false)], &[]);
+        let s = scheme(&[r"^\S+ "], &[]);
         assert_eq!(
             process(b"2026-10-04 02:11:37 msg", &s, Escape::Unprintable).text(),
             "02:11:37 msg"
         );
 
-        let s = scheme(&[("b", false)], &[]);
+        let s = scheme(&["b"], &[]);
         assert_eq!(process(b"abcbd", &s, Escape::Unprintable).text(), "acd");
     }
 
     #[test]
     fn strip_groups() {
         // The example from multitail configuration, replacing "-kr 0 7 -kr 15 22".
-        let s = scheme(&[(r"^(\S+ +\d+ )\S+( \S+)", true)], &[]);
+        let s = scheme(&[r"^(\S+ +\d+ )\S+( \S+)"], &[]);
         assert_eq!(
             process(
                 b"Oct  4 02:11:37 host vmunix: segfault",
@@ -674,17 +674,17 @@ mod tests {
     #[test]
     fn strip_all_patterns_use_original_text() {
         // The second pattern wouldn't match if it were applied after the first.
-        let s = scheme(&[("^a", false), ("^ab", false), ("d", false)], &[]);
+        let s = scheme(&["^a", "^ab", "d"], &[]);
         assert_eq!(process(b"abcd", &s, Escape::Unprintable).text(), "c");
 
         // Overlapping matches.
-        let s = scheme(&[("abc", false), ("bcd", false)], &[]);
+        let s = scheme(&["abc", "bcd"], &[]);
         assert_eq!(process(b"abcde", &s, Escape::Unprintable).text(), "e");
     }
 
     #[test]
     fn strip_everything() {
-        let s = scheme(&[(".*", false)], &[]);
+        let s = scheme(&[".*"], &[]);
         let line = process(b"anything", &s, Escape::Unprintable);
         assert_eq!(line.text(), "");
         assert!(line.spans().is_empty());
@@ -692,26 +692,26 @@ mod tests {
 
     #[test]
     fn strip_empty_matches() {
-        let s = scheme(&[("x*", false), ("^", false), ("$", false)], &[]);
+        let s = scheme(&["x*", "^", "$"], &[]);
         assert_eq!(process(b"abc", &s, Escape::Unprintable).text(), "abc");
     }
 
     #[test]
     fn strip_keeps_special_text() {
         // The pattern overlaps the start of "\xFF" only.
-        let s = scheme(&[(r"^a\\", false)], &[]);
+        let s = scheme(&[r"^a\\"], &[]);
         let line = process(b"a\xffb", &s, Escape::Unprintable);
         assert_eq!(segments(&line), [("\\xFF", SPECIAL_STYLE), ("b", NONE)]);
 
         // The pattern covers special text entirely.
-        let s = scheme(&[("^.*$", false)], &[]);
+        let s = scheme(&["^.*$"], &[]);
         let line = process(b"a\x1bb\x07c", &s, Escape::Unprintable);
         assert_eq!(segments(&line), [("^[^G", SPECIAL_STYLE)]);
     }
 
     #[test]
     fn strip_then_expand_tabs() {
-        let s = scheme(&[("^abc", false)], &[]);
+        let s = scheme(&["^abc"], &[]);
         assert_eq!(
             process(b"abc\tx", &s, Escape::Unprintable).text(),
             format!("{}x", " ".repeat(8))
@@ -720,7 +720,7 @@ mod tests {
 
     #[test]
     fn colour_whole_matches() {
-        let s = scheme(&[], &[("b+", false, "red")]);
+        let s = scheme(&[], &[("b+", "red")]);
         let line = process(b"abbcb", &s, Escape::Unprintable);
         assert_eq!(
             segments(&line),
@@ -730,7 +730,7 @@ mod tests {
 
     #[test]
     fn colour_groups() {
-        let s = scheme(&[], &[("(a)b(c)", true, "red")]);
+        let s = scheme(&[], &[("(a)b(c)", "red")]);
         let line = process(b"xabcx", &s, Escape::Unprintable);
         assert_eq!(
             segments(&line),
@@ -744,7 +744,7 @@ mod tests {
         );
 
         // Groups not participating in the match are skipped.
-        let s = scheme(&[], &[("(x)?(y)", true, "red")]);
+        let s = scheme(&[], &[("(x)?(y)", "red")]);
         assert_eq!(
             segments(&process(b"ay", &s, Escape::Unprintable)),
             [("a", NONE), ("y", RED)]
@@ -753,7 +753,7 @@ mod tests {
 
     #[test]
     fn colour_first_rule_wins() {
-        let s = scheme(&[], &[("b", false, "red"), ("abc", false, "blue")]);
+        let s = scheme(&[], &[("b", "red"), ("abc", "blue")]);
         let line = process(b"abcd", &s, Escape::Unprintable);
         assert_eq!(
             segments(&line),
@@ -761,7 +761,7 @@ mod tests {
         );
 
         // Later rules can't change anything already coloured.
-        let s = scheme(&[], &[("abc", false, "blue"), ("b", false, "red")]);
+        let s = scheme(&[], &[("abc", "blue"), ("b", "red")]);
         assert_eq!(
             segments(&process(b"abcd", &s, Escape::Unprintable)),
             [("abc", BLUE), ("d", NONE)]
@@ -770,10 +770,7 @@ mod tests {
 
     #[test]
     fn colour_empty_style_claims_text() {
-        let s = scheme(
-            &[],
-            &[("^.*rspamd.*$", false, ""), ("U=(\\S+)", true, "red")],
-        );
+        let s = scheme(&[], &[("^.*rspamd.*$", ""), ("U=(\\S+)", "red")]);
         assert_eq!(
             segments(&process(b"U=_rspamd", &s, Escape::Unprintable)),
             [("U=_rspamd", NONE)]
@@ -786,7 +783,7 @@ mod tests {
 
     #[test]
     fn colour_merges_adjacent_spans() {
-        let s = scheme(&[], &[("a", false, "red"), ("b", false, "red")]);
+        let s = scheme(&[], &[("a", "red"), ("b", "red")]);
         assert_eq!(
             segments(&process(b"abc", &s, Escape::Unprintable)),
             [("ab", RED), ("c", NONE)]
@@ -795,7 +792,7 @@ mod tests {
 
     #[test]
     fn colour_after_strip() {
-        let s = scheme(&[(r"^\S+ ", false)], &[(r"^(\S+)", true, "red")]);
+        let s = scheme(&[r"^\S+ "], &[(r"^(\S+)", "red")]);
         assert_eq!(
             segments(&process(b"date time msg", &s, Escape::Unprintable)),
             [("time", RED), (" msg", NONE)]
@@ -804,7 +801,7 @@ mod tests {
 
     #[test]
     fn colour_special_text_overrides() {
-        let s = scheme(&[], &[(".*", false, "red")]);
+        let s = scheme(&[], &[(".*", "red")]);
         let line = process(b"a\x1bb", &s, Escape::Unprintable);
         assert_eq!(
             segments(&line),
@@ -814,7 +811,7 @@ mod tests {
 
     #[test]
     fn colour_tabs() {
-        let s = scheme(&[], &[(r"\t", false, "red")]);
+        let s = scheme(&[], &[(r"\t", "red")]);
         let line = process(b"a\tb", &s, Escape::Unprintable);
         assert_eq!(
             segments(&line),
@@ -824,7 +821,7 @@ mod tests {
 
     #[test]
     fn colour_multibyte() {
-        let s = scheme(&[], &[("(é)", true, "red")]);
+        let s = scheme(&[], &[("(é)", "red")]);
         assert_eq!(
             segments(&process("aéb".as_bytes(), &s, Escape::Unprintable)),
             [("a", NONE), ("é", RED), ("b", NONE)]
@@ -839,12 +836,8 @@ mod tests {
     #[allow(clippy::single_range_in_vec_init)]
     fn explain_strip_and_rules() {
         let s = scheme(
-            &[(r"^\S+ ", false), ("x*", false), ("nope", false)],
-            &[
-                ("b+", false, "red"),
-                ("ab", false, "blue"),
-                ("(a)(c)?", true, "red"),
-            ],
+            &[r"^\S+ ", "x*", "nope"],
+            &[("b+", "red"), ("ab", "blue"), ("(a)(c)?", "red")],
         );
         let e = explain(b"date abbb ab\tc\x1b", &s, Escape::Unprintable);
         assert_eq!(e.sanitised, "date abbb ab\tc^[");
@@ -864,7 +857,7 @@ mod tests {
     #[test]
     fn explain_nested_groups() {
         // Matches of the same rule don't hide each other.
-        let s = scheme(&[], &[("b", false, "red"), ("((a)b)", true, "blue")]);
+        let s = scheme(&[], &[("b", "red"), ("((a)b)", "blue")]);
         let e = explain(b"ab", &s, Escape::Unprintable);
         assert_eq!(
             e.rules,
@@ -889,7 +882,7 @@ mod tests {
     #[allow(clippy::single_range_in_vec_init)]
     fn highlighted() {
         const HL: Style = Style::new().bg(Color::Yellow);
-        let s = scheme(&[], &[("b+", false, "red")]);
+        let s = scheme(&[], &[("b+", "red")]);
         let line = process(b"aabbbcc", &s, Escape::Unprintable);
 
         let segments = |ranges: &[Range<usize>]| -> Vec<(String, Style)> {
@@ -947,21 +940,18 @@ mod tests {
     fn test_schemes() -> Vec<Scheme> {
         vec![
             Scheme::default(),
-            scheme(&[(".", false)], &[]),
-            scheme(
-                &[(r"^.{0,5}", false), (r"(\S+)\s", true), (r"\\", false)],
-                &[(".", false, "red")],
-            ),
+            scheme(&["."], &[]),
+            scheme(&[r"^.{0,5}", r"(\S+)\s", r"\\"], &[(".", "red")]),
             scheme(
                 &[],
                 &[
-                    ("x*", false, "blue"),
-                    ("(a)|(b)", true, "bold red"),
-                    (r"\\x", false, "green"),
-                    ("^", false, "yellow"),
-                    (r"\s", false, "on white"),
-                    ("", false, "underline"),
-                    (".*", false, "color100"),
+                    ("x*", "blue"),
+                    ("(a)|(b)", "bold red"),
+                    (r"\\x", "green"),
+                    ("^", "yellow"),
+                    (r"\s", "on white"),
+                    ("", "underline"),
+                    (".*", "color100"),
                 ],
             ),
         ]
@@ -979,7 +969,7 @@ mod tests {
         #[test]
         fn highlighted_invariants(raw in raw_line(), n in 0..4usize) {
             const HL: Style = Style::new().bg(Color::Yellow).add_modifier(Modifier::BOLD);
-            let s = scheme(&[], &[("[aeiou]+", false, "red"), (r"\\", false, "blue")]);
+            let s = scheme(&[], &[("[aeiou]+", "red"), (r"\\", "blue")]);
             let line = process(&raw, &s, Escape::Unprintable);
             let regex = regex::Regex::new(["x", "[a-z]+", ".", r"\s*"][n]).unwrap();
             let ranges: Vec<_> = regex.find_iter(line.text()).map(|m| m.range()).collect();

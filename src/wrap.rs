@@ -305,7 +305,7 @@ mod tests {
 
     #[test]
     fn styles() {
-        let s = scheme(&[], &[("B+", false, "red")]);
+        let s = scheme(&[], &[("B+", "red")]);
         let line = process(b"aaBBBBcc", &s, Escape::Unprintable);
         let rows = wrap(&line, 3);
         let segments: Vec<Vec<_>> = rows.iter().map(|r| r.segments().collect()).collect();
@@ -355,7 +355,7 @@ mod tests {
     #[test]
     fn cluster_uses_style_of_first_character() {
         // The rule colours the combining characters differently.
-        let s = scheme(&[], &[(r"\p{M}", false, "blue"), ("e", false, "red")]);
+        let s = scheme(&[], &[(r"\p{M}", "blue"), ("e", "red")]);
         let line = process("ae\u{301}b\u{301}".as_bytes(), &s, Escape::Unprintable);
         let rows = wrap(&line, 10);
         let segments: Vec<_> = rows[0].segments().collect();
@@ -406,7 +406,7 @@ mod tests {
 
     #[test]
     fn clip_ascii() {
-        let s = scheme(&[], &[("c+", false, "red")]);
+        let s = scheme(&[], &[("c+", "red")]);
         let line = process(b"abcccdef", &s, Escape::Unprintable);
         assert_eq!(clipped(&line, 0, 3), (0, "abc".to_owned()));
         assert_eq!(clipped(&line, 3, 3), (0, "ccd".to_owned()));
@@ -460,7 +460,7 @@ mod tests {
             text in "[ -~]{0,100}",
             width in 1..20usize,
         ) {
-            let s = scheme(&[], &[("[aeiou]+", false, "red"), ("x.", false, "bold")]);
+            let s = scheme(&[], &[("[aeiou]+", "red"), ("x.", "bold")]);
             let line = process(text.as_bytes(), &s, Escape::Unprintable);
             prop_assert_eq!(wrap_ascii(&line, width), wrap_graphemes(&line, width));
         }
@@ -470,10 +470,10 @@ mod tests {
             let s = scheme(
                 &[],
                 &[
-                    (r"\p{M}", false, "blue"),
-                    ("[aeiou]", false, "red"),
-                    ("日", false, "bold"),
-                    (r"\\", false, "underline"),
+                    (r"\p{M}", "blue"),
+                    ("[aeiou]", "red"),
+                    ("日", "bold"),
+                    (r"\\", "underline"),
                 ],
             );
             let line = process(&raw, &s, Escape::Unprintable);

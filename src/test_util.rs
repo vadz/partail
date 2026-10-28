@@ -6,18 +6,17 @@ use crate::config::{Rule, Scheme};
 use crate::pattern::Pattern;
 use crate::style;
 
-/// Creates a scheme from (regex, groups) strip patterns and
-/// (regex, groups, style) colour rules.
-pub fn scheme(strip: &[(&str, bool)], rules: &[(&str, bool, &str)]) -> Scheme {
+/// Creates a scheme from strip patterns and (regex, style) colour rules.
+pub fn scheme(strip: &[&str], rules: &[(&str, &str)]) -> Scheme {
     Scheme {
         strip: strip
             .iter()
-            .map(|&(regex, groups)| Pattern::new(regex, groups).unwrap())
+            .map(|regex| Pattern::new(regex).unwrap())
             .collect(),
         rules: rules
             .iter()
-            .map(|&(regex, groups, s)| Rule {
-                pattern: Pattern::new(regex, groups).unwrap(),
+            .map(|&(regex, s)| Rule {
+                pattern: Pattern::new(regex).unwrap(),
                 style: style::parse(s).unwrap(),
             })
             .collect(),

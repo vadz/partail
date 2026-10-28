@@ -144,7 +144,7 @@ scheme = "exim"
 [scheme.syslog]
 # Parts of the line removed before colouring it, here the date and the host
 # name, keeping the time.
-strip = [ { regex = '^(\S+ +\d+ )\S+( \S+)', groups = true } ]
+strip = [ { regex = '^(\S+ +\d+ )\S+( \S+)' } ]
 
 # Colouring rules: the first rule colouring a character takes precedence over
 # all the subsequent ones.
@@ -154,7 +154,6 @@ style = "bold red"
 
 [[scheme.syslog.rule]]
 regex = '^..:..:.. (CRON\[[0-9]+\]):'
-groups = true
 style = "bright-black"
 
 [[scheme.syslog.rule]]
@@ -166,7 +165,6 @@ strip = [ { regex = '^\S+ ' } ]
 
 [[scheme.exim.rule]]
 regex = '<= (\S+)'
-groups = true
 style = "cyan"
 
 [status]
@@ -183,16 +181,21 @@ regular expression or style, is reported with its location when starting.
 A scheme defines how the lines of the windows using it are processed:
 
 1. All `strip` regexes are matched against the line and the text matched by
-   any of them is removed. With `groups = true`, only the parts matched by
-   the capture groups are removed and not the entire match.
+   any of them is removed.
 2. The `rule` regexes are matched against the remaining text, in order, and
-   each character gets the style of the first rule matching it. With
-   `groups = true`, only the capture groups are styled, otherwise the whole
-   match is. A rule with an empty style, `""`, doesn't change the appearance
-   of the text, but prevents the subsequent rules from styling it.
+   each character gets the style of the first rule matching it. A rule with
+   an empty style, `""`, doesn't change the appearance of the text, but
+   prevents the subsequent rules from styling it.
 
 All matches in the line are used, not just the first one. Both kinds of
 regexes use the [regex crate syntax](https://docs.rs/regex/latest/regex/#syntax).
+
+If a regex contains capture groups, only the parts of the matches captured by
+them are removed or styled, otherwise the whole match is. Use non-capturing
+groups, `(?:...)`, for grouping parts of the regex without selecting them,
+e.g. `\[(?:[0-9]{1,3}\.){3}[0-9]{1,3}]` styles the whole bracketed IPv4
+address, while with `(...)` instead of `(?:...)` only the last captured
+repetition, such as `1.`, would be styled.
 
 ### Testing schemes
 
@@ -294,6 +297,9 @@ reading from them could block or never end.
 - The configuration file uses a different format and options.
 - Byte ranges can't be removed from the lines (multitail `-kr` option), but
   regexes can be used for the same purpose, more robustly.
+- There is no distinction between `cs_re` and `cs_re_s`: rules with capture
+  groups behave like `cs_re_s`, so their groups that are used only for
+  grouping must be made non-capturing, i.e. `(...)` must become `(?:...)`.
 - multitail stops colouring the capture groups of a rule after the first one
   which didn't participate in the match, while `partail` colours all those
   that did.

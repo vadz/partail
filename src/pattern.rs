@@ -1,56 +1,29 @@
 //! Regex-based patterns used by both strip and colour rules.
 
-use std::fmt;
 use std::ops::Range;
 
 use regex::Regex;
 
-/// A regex selecting either its whole matches or only their capture groups.
+/// A regex selecting either its whole matches or, if it has any capture
+/// groups, only their parts matched by these groups.
 #[derive(Debug, Clone)]
 pub struct Pattern {
     regex: Regex,
     groups: bool,
 }
 
-/// Error returned by [`Pattern::new`].
-#[derive(Debug, Clone)]
-pub enum PatternError {
-    /// The regex couldn't be compiled.
-    Regex(regex::Error),
-    /// Only capture groups were requested, but the regex has none.
-    NoGroups,
-}
-
-impl fmt::Display for PatternError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            // The details are available from source().
-            Self::Regex(_) => write!(f, "invalid regex"),
-            Self::NoGroups => write!(f, "\"groups = true\" requires a regex with capture groups"),
-        }
-    }
-}
-
-impl std::error::Error for PatternError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Regex(e) => Some(e),
-            Self::NoGroups => None,
-        }
-    }
-}
-
 impl Pattern {
-    /// Compiles the regex. If `groups` is true, only the parts of the matches
-    /// corresponding to capture groups are selected, so there must be at
-    /// least one of them.
-    pub fn new(regex: &str, groups: bool) -> Result<Self, PatternError> {
-        let regex = Regex::new(regex).map_err(PatternError::Regex)?;
+    /// Compiles the regex.
+    ///
+    /// Capturing groups are only used for selecting the parts of the matches,
+    /// as the regex syntax has no backreferences, so non-capturing groups,
+    /// i.e. `(?:...)`, must be used when grouping is needed for other
+    /// purposes, e.g. repetition or alternation.
+    pub fn new(regex: &str) -> Result<Self, regex::Error> {
+        let regex = Regex::new(regex)?;
 
         // The implicit group for the whole match is always counted.
-        if groups && regex.captures_len() < 2 {
-            return Err(PatternError::NoGroups);
-        }
+        let groups = regex.captures_len() > 1;
 
         Ok(Self { regex, groups })
     }
@@ -88,17 +61,18 @@ mod tests {
 
     #[test]
     fn valid() {
-        let p = Pattern::new("a(b)c", true).unwrap();
+        let p = Pattern::new("a(b)c").unwrap();
         assert!(p.groups());
         assert_eq!(p.regex().as_str(), "a(b)c");
 
-        assert!(!Pattern::new("abc", false).unwrap().groups());
-        assert!(Pattern::new("a(b)c", false).is_ok());
+        assert!(!Pattern::new("abc").unwrap().groups());
+        // Non-capturing groups don't count.
+        assert!(!Pattern::new("a(?:b)c").unwrap().groups());
     }
 
-    fn ranges(regex: &str, groups: bool, text: &str) -> Vec<Range<usize>> {
+    fn ranges(regex: &str, text: &str) -> Vec<Range<usize>> {
         let mut ranges = Vec::new();
-        Pattern::new(regex, groups)
+        Pattern::new(regex)
             .unwrap()
             .for_each_range(text, |r| ranges.push(r));
         ranges
@@ -106,46 +80,32 @@ mod tests {
 
     #[test]
     fn whole_matches() {
-        assert_eq!(ranges("b+", false, "abbcb"), [1..3, 4..5]);
-        assert!(ranges("x", false, "abc").is_empty());
-        assert_eq!(ranges("^.", false, "abc"), [0..1]);
-        // Groups don't matter if only whole matches are selected.
-        assert_eq!(ranges("a(b)", false, "abab"), [0..2, 2..4]);
+        assert_eq!(ranges("b+", "abbcb"), [1..3, 4..5]);
+        assert!(ranges("x", "abc").is_empty());
+        assert_eq!(ranges("^.", "abc"), [0..1]);
+        // Non-capturing groups select the whole match.
+        assert_eq!(ranges(r"(?:\d\.){2}\d", "v1.2.3"), [1..6]);
         // Empty matches are reported, but are harmless.
-        assert_eq!(ranges("x*", false, "ab"), [0..0, 1..1, 2..2]);
+        assert_eq!(ranges("x*", "ab"), [0..0, 1..1, 2..2]);
     }
 
     #[test]
     fn group_matches() {
-        assert_eq!(ranges("(a)b(c)", true, "abcabc"), [0..1, 2..3, 3..4, 5..6]);
+        assert_eq!(ranges("(a)b(c)", "abcabc"), [0..1, 2..3, 3..4, 5..6]);
         // Groups that don't participate are skipped, but later ones are not.
-        assert_eq!(ranges("(x)?(y)", true, "y"), [0..1]);
-        assert_eq!(ranges("(a)|(b)", true, "ab"), [0..1, 1..2]);
+        assert_eq!(ranges("(x)?(y)", "y"), [0..1]);
+        assert_eq!(ranges("(a)|(b)", "ab"), [0..1, 1..2]);
         // Nested groups are all reported.
-        assert_eq!(ranges("((a)b)", true, "ab"), [0..2, 0..1]);
+        assert_eq!(ranges("((a)b)", "ab"), [0..2, 0..1]);
+        // Named groups count too.
+        assert_eq!(ranges("a(?<n>b)", "ab"), [1..2]);
         // Positions are in bytes.
-        assert_eq!(ranges("é(.)", true, "aéb"), [3..4]);
+        assert_eq!(ranges("é(.)", "aéb"), [3..4]);
     }
 
     #[test]
     fn invalid_regex() {
-        let e = Pattern::new("a(b", false).unwrap_err();
-        assert!(matches!(e, PatternError::Regex(_)));
-        assert_eq!(e.to_string(), "invalid regex");
-        let source = std::error::Error::source(&e).expect("regex error as source");
-        assert!(source.to_string().contains("unclosed group"), "{source}");
-    }
-
-    #[test]
-    fn groups_required() {
-        assert!(matches!(
-            Pattern::new("abc", true),
-            Err(PatternError::NoGroups)
-        ));
-        // Non-capturing groups don't count.
-        assert!(matches!(
-            Pattern::new("a(?:b)c", true),
-            Err(PatternError::NoGroups)
-        ));
+        let e = Pattern::new("a(b").unwrap_err();
+        assert!(e.to_string().contains("unclosed group"), "{e}");
     }
 }
