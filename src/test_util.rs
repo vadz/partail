@@ -2,7 +2,7 @@
 
 use proptest::prelude::*;
 
-use crate::config::{Rule, Scheme};
+use crate::config::{Rule, Scheme, Strip};
 use crate::pattern::Pattern;
 use crate::style;
 
@@ -11,11 +11,15 @@ pub fn scheme(strip: &[&str], rules: &[(&str, &str)]) -> Scheme {
     Scheme {
         strip: strip
             .iter()
-            .map(|regex| Pattern::new(regex).unwrap())
+            .map(|regex| Strip {
+                name: None,
+                pattern: Pattern::new(regex).unwrap(),
+            })
             .collect(),
         rules: rules
             .iter()
             .map(|&(regex, s)| Rule {
+                name: None,
                 pattern: Pattern::new(regex).unwrap(),
                 style: style::parse(s).unwrap(),
             })

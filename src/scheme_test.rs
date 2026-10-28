@@ -9,6 +9,7 @@ use ratatui::style::Style;
 
 use partail::config::Scheme;
 use partail::line::{self, Escape, Explanation};
+use partail::pattern::Pattern;
 
 /// Outputs the given lines, or the lines read from the standard input if
 /// there are none, processed using the scheme. If `verbose` is true, also
@@ -67,12 +68,12 @@ impl Tester<'_> {
     fn write_explanation(&self, out: &mut impl Write, e: &Explanation) -> io::Result<()> {
         let mut matched = false;
 
-        for (n, (pattern, ranges)) in self.scheme.strip.iter().zip(&e.strips).enumerate() {
+        for (n, (strip, ranges)) in self.scheme.strip.iter().zip(&e.strips).enumerate() {
             if ranges.is_empty() {
                 continue;
             }
             matched = true;
-            write!(out, "  strip {} '{}':", n + 1, pattern.regex().as_str())?;
+            write_label(out, "strip", n, strip.name.as_deref(), &strip.pattern)?;
             for range in ranges {
                 write!(out, " \"{}\"", e.sanitised.get(range.clone()).unwrap_or(""))?;
             }
@@ -84,7 +85,7 @@ impl Tester<'_> {
                 continue;
             }
             matched = true;
-            write!(out, "  rule {} '{}':", n + 1, rule.pattern.regex().as_str())?;
+            write_label(out, "rule", n, rule.name.as_deref(), &rule.pattern)?;
             for m in matches {
                 write!(out, " \"")?;
                 write_styled(
@@ -106,6 +107,21 @@ impl Tester<'_> {
             writeln!(out, "  no matches")?;
         }
         Ok(())
+    }
+}
+
+/// Writes the label identifying the strip pattern or rule with the given
+/// 0-based index by its name, if it has one, or its regex otherwise.
+fn write_label(
+    out: &mut impl Write,
+    kind: &str,
+    n: usize,
+    name: Option<&str>,
+    pattern: &Pattern,
+) -> io::Result<()> {
+    match name {
+        Some(name) => write!(out, "  {kind} {} ({name}):", n + 1),
+        None => write!(out, "  {kind} {} '{}':", n + 1, pattern.regex().as_str()),
     }
 }
 
@@ -136,13 +152,14 @@ mod tests {
 
     const CONFIG: &str = r#"
 [scheme.s]
-strip = [ { regex = '^\S+ ' } ]
+strip = [ { regex = '^\S+ ' }, { name = "tail", regex = ' !$' } ]
 
 [[scheme.s.rule]]
 regex = 'b+'
 style = "red"
 
 [[scheme.s.rule]]
+name = "a then b"
 regex = 'ab'
 style = "bold"
 
@@ -169,12 +186,12 @@ style = ""
             "ESC[1maESC[0mESC[38;5;1mbbESC[39ma\n  \
              strip 1 '^\\S+ ': \"date \"\n  \
              rule 1 'b+': \"ESC[38;5;1mbbESC[39m\"\n  \
-             rule 2 'ab': \"ESC[1mabESC[0m\" (partly overridden)\n  \
+             rule 2 (a then b): \"ESC[1mabESC[0m\" (partly overridden)\n  \
              rule 3 '(a)(x)?': \"a\" (overridden) \"a\"\n"
         );
         assert_eq!(
-            output(CONFIG, true, b"date c"),
-            "c\n  strip 1 '^\\S+ ': \"date \"\n"
+            output(CONFIG, true, b"date c !"),
+            "c\n  strip 1 '^\\S+ ': \"date \"\n  strip 2 (tail): \" !\"\n"
         );
         assert_eq!(output(CONFIG, true, b"c"), "c\n  no matches\n");
     }

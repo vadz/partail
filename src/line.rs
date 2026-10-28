@@ -22,7 +22,7 @@ use serde::Deserialize;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthChar;
 
-use crate::config::{Rule, Scheme};
+use crate::config::{Rule, Scheme, Strip};
 use crate::pattern::Pattern;
 
 /// Style used for the representation of characters which can't be shown.
@@ -236,7 +236,7 @@ pub fn explain(raw: &[u8], scheme: &Scheme, escape: Escape) -> Explanation {
     let strips = scheme
         .strip
         .iter()
-        .map(|pattern| non_empty_ranges(pattern, &sanitised.text))
+        .map(|s| non_empty_ranges(&s.pattern, &sanitised.text))
         .collect();
     let sanitised_text = sanitised.text.clone();
     let stripped = strip(sanitised, &scheme.strip).text;
@@ -405,10 +405,10 @@ fn is_format(c: char) -> bool {
 
 /// Removes the parts of the text matched by any of the patterns, which are
 /// all applied to the original text. Special text is never removed.
-fn strip(text: Marked, patterns: &[Pattern]) -> Marked {
+fn strip(text: Marked, strips: &[Strip]) -> Marked {
     let mut remove = vec![false; text.text.len()];
-    for pattern in patterns {
-        pattern.for_each_range(&text.text, |range| {
+    for s in strips {
+        s.pattern.for_each_range(&text.text, |range| {
             if let Some(bytes) = remove.get_mut(range) {
                 bytes.fill(true);
             }

@@ -143,12 +143,15 @@ scheme = "exim"
 
 [scheme.syslog]
 # Parts of the line removed before colouring it, here the date and the host
-# name, keeping the time.
-strip = [ { regex = '^(\S+ +\d+ )\S+( \S+)' } ]
+# name, keeping the time. The name is optional and used for referring to the
+# pattern in messages.
+strip = [ { name = "date and host", regex = '^(\S+ +\d+ )\S+( \S+)' } ]
 
 # Colouring rules: the first rule colouring a character takes precedence over
 # all the subsequent ones.
 [[scheme.syslog.rule]]
+# Optional name used for referring to the rule in messages.
+name = "segfault"
 regex = 'segfault at'
 style = "bold red"
 
@@ -214,6 +217,8 @@ With `-v`, what each strip pattern and rule matched is shown after each line,
 with the matches of each rule in its style. The matches of a rule which don't
 change the line because earlier rules already styled the same text are marked
 as `(overridden)`, or `(partly overridden)` if only a part of the match is.
+Strip patterns and rules are identified by their number in the scheme and
+their `name`, if they have one, or their regex otherwise.
 
 ### Styles
 

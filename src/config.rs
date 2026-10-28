@@ -51,14 +51,24 @@ pub struct Window {
 /// any `strip` pattern, then style the remaining text using `rules`.
 #[derive(Debug, Default)]
 pub struct Scheme {
-    pub strip: Vec<Pattern>,
+    pub strip: Vec<Strip>,
     /// The first rule styling a character takes precedence over later ones.
     pub rules: Vec<Rule>,
+}
+
+/// A pattern removing the text it matches.
+#[derive(Debug)]
+pub struct Strip {
+    /// Optional name used for referring to the pattern in messages.
+    pub name: Option<String>,
+    pub pattern: Pattern,
 }
 
 /// A colour rule.
 #[derive(Debug)]
 pub struct Rule {
+    /// Optional name used for referring to the rule in messages.
+    pub name: Option<String>,
     pub pattern: Pattern,
     pub style: Style,
 }
@@ -114,12 +124,14 @@ mod raw {
     #[derive(Debug, Deserialize)]
     #[serde(deny_unknown_fields)]
     pub struct Strip {
+        pub name: Option<String>,
         pub regex: String,
     }
 
     #[derive(Debug, Deserialize)]
     #[serde(deny_unknown_fields)]
     pub struct Rule {
+        pub name: Option<String>,
         pub regex: String,
         pub style: String,
     }
@@ -199,28 +211,63 @@ fn compile_scheme(raw: raw::Scheme) -> anyhow::Result<Scheme> {
         .strip
         .into_iter()
         .enumerate()
-        .map(|(n, s)| compile_pattern(&s.regex).with_context(|| format!("strip {}", n + 1)))
+        .map(|(n, s)| {
+            let what = describe("strip", n, s.name.as_deref());
+            compile_strip(s).context(what)
+        })
         .collect::<anyhow::Result<_>>()?;
 
     let rules = raw
         .rule
         .into_iter()
         .enumerate()
-        .map(|(n, r)| compile_rule(r).with_context(|| format!("rule {}", n + 1)))
+        .map(|(n, r)| {
+            let what = describe("rule", n, r.name.as_deref());
+            compile_rule(r).context(what)
+        })
         .collect::<anyhow::Result<_>>()?;
 
     Ok(Scheme { strip, rules })
+}
+
+/// Returns the description of the strip pattern or rule with the given
+/// 0-based index and optional name used in the error messages.
+fn describe(kind: &str, n: usize, name: Option<&str>) -> String {
+    match name {
+        Some(name) if !name.is_empty() => format!("{kind} {} ({name})", n + 1),
+        _ => format!("{kind} {}", n + 1),
+    }
+}
+
+fn check_name(name: Option<&str>) -> anyhow::Result<()> {
+    if name == Some("") {
+        bail!("name must not be empty");
+    }
+    Ok(())
 }
 
 fn compile_pattern(regex: &str) -> anyhow::Result<Pattern> {
     Pattern::new(regex).context("invalid regex")
 }
 
+fn compile_strip(raw: raw::Strip) -> anyhow::Result<Strip> {
+    check_name(raw.name.as_deref())?;
+    Ok(Strip {
+        pattern: compile_pattern(&raw.regex)?,
+        name: raw.name,
+    })
+}
+
 fn compile_rule(raw: raw::Rule) -> anyhow::Result<Rule> {
+    check_name(raw.name.as_deref())?;
     let pattern = compile_pattern(&raw.regex)?;
     let style =
         style::parse(&raw.style).with_context(|| format!("invalid style \"{}\"", raw.style))?;
-    Ok(Rule { pattern, style })
+    Ok(Rule {
+        name: raw.name,
+        pattern,
+        style,
+    })
 }
 
 fn compile_window(
@@ -322,9 +369,10 @@ file = "plain.log"
 wrap = false
 
 [scheme.syslog]
-strip = [ { regex = '^(\S+ +\d+ )\S+( \S+)' } ]
+strip = [ { name = "date and host", regex = '^(\S+ +\d+ )\S+( \S+)' } ]
 
 [[scheme.syslog.rule]]
+name = "segfault"
 regex = 'vmunix: ([^:]*): segfault at'
 style = "red bold"
 
@@ -352,9 +400,15 @@ strip = [ { regex = '^\S+ ' } ]
         assert_eq!(syslog.file, Path::new("/var/log/syslog"));
         assert_eq!(syslog.height.map(NonZeroU16::get), Some(40));
         assert_eq!(syslog.scheme.strip.len(), 1);
-        assert!(syslog.scheme.strip[0].groups());
+        assert_eq!(
+            syslog.scheme.strip[0].name.as_deref(),
+            Some("date and host")
+        );
+        assert!(syslog.scheme.strip[0].pattern.groups());
         let rules = &syslog.scheme.rules;
         assert_eq!(rules.len(), 3);
+        assert_eq!(rules[0].name.as_deref(), Some("segfault"));
+        assert_eq!(rules[1].name, None);
         assert_eq!(
             rules[0].pattern.regex().as_str(),
             "vmunix: ([^:]*): segfault at"
@@ -371,7 +425,8 @@ strip = [ { regex = '^\S+ ' } ]
         let exim = &config.windows[1];
         assert_eq!(exim.height, None);
         assert_eq!(exim.scheme.strip.len(), 1);
-        assert!(!exim.scheme.strip[0].groups());
+        assert_eq!(exim.scheme.strip[0].name, None);
+        assert!(!exim.scheme.strip[0].pattern.groups());
         assert!(exim.scheme.rules.is_empty());
 
         assert!(config.windows[0].wrap);
@@ -470,8 +525,25 @@ scheme = "s"
             "scheme \"s\": rule 1: invalid style \"purple bold\": unknown word \"purple\"",
         );
         assert_err_contains(
+            "[[scheme.s.rule]]\nregex = 'a'\nstyle = ''\n\
+             [[scheme.s.rule]]\nname = 'bad'\nregex = 'a'\nstyle = 'purple'",
+            "scheme \"s\": rule 2 (bad): invalid style \"purple\"",
+        );
+        assert_err_contains(
+            "[[scheme.s.rule]]\nname = ''\nregex = 'a'\nstyle = ''",
+            "scheme \"s\": rule 1: name must not be empty",
+        );
+        assert_err_contains(
             "[scheme.s]\nstrip = [ { regex = 'a' }, { regex = '[' } ]",
             "scheme \"s\": strip 2: invalid regex: ",
+        );
+        assert_err_contains(
+            "[scheme.s]\nstrip = [ { name = 'brackets', regex = '[' } ]",
+            "scheme \"s\": strip 1 (brackets): invalid regex: ",
+        );
+        assert_err_contains(
+            "[scheme.s]\nstrip = [ { name = '', regex = 'a' } ]",
+            "scheme \"s\": strip 1: name must not be empty",
         );
         // The option for selecting the groups doesn't exist any more.
         assert_err_contains(
