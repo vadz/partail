@@ -1142,6 +1142,7 @@ mod tests {
     ) -> App {
         let config = Config {
             scrollback: scrollback.try_into().unwrap(),
+            schemes: Default::default(),
             windows: windows
                 .iter()
                 .map(|&(file, height)| Window {
@@ -1633,6 +1634,7 @@ mod tests {
     fn escape_wide() {
         let config = Config {
             scrollback: 100.try_into().unwrap(),
+            schemes: Default::default(),
             windows: vec![Window {
                 file: PathBuf::from("日"),
                 height: None,
@@ -2150,6 +2152,7 @@ style = "bold on blue"
     fn wrap_configured_per_window() {
         let config = Config {
             scrollback: 100.try_into().unwrap(),
+            schemes: Default::default(),
             windows: [true, false]
                 .map(|wrap| Window {
                     file: PathBuf::from("f"),

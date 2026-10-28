@@ -206,6 +206,85 @@ pub fn process(raw: &[u8], scheme: &Scheme, escape: Escape) -> Line {
     build(&text, &styles)
 }
 
+/// What the patterns of a scheme matched in a line, see [`explain`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Explanation {
+    /// Sanitised text, to which the strip patterns are applied.
+    pub sanitised: String,
+    /// Non-empty ranges of `sanitised` matched by each strip pattern.
+    pub strips: Vec<Vec<Range<usize>>>,
+    /// Text remaining after stripping, to which the rules are applied.
+    pub stripped: String,
+    /// Non-empty matches of each rule in `stripped`.
+    pub rules: Vec<Vec<RuleMatch>>,
+}
+
+/// A part of the text selected by a colour rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleMatch {
+    /// Range of bytes of the text.
+    pub range: Range<usize>,
+    /// Number of bytes of the range not already claimed by an earlier rule,
+    /// i.e. which get the style of this rule, unless they're special text.
+    pub claimed: usize,
+}
+
+/// Returns what each strip pattern and colour rule of the scheme matches
+/// when [`process`] is called with the same arguments.
+pub fn explain(raw: &[u8], scheme: &Scheme, escape: Escape) -> Explanation {
+    let sanitised = sanitise(raw, escape);
+    let strips = scheme
+        .strip
+        .iter()
+        .map(|pattern| non_empty_ranges(pattern, &sanitised.text))
+        .collect();
+    let sanitised_text = sanitised.text.clone();
+    let stripped = strip(sanitised, &scheme.strip).text;
+
+    let mut claimed = vec![false; stripped.len()];
+    let rules = scheme
+        .rules
+        .iter()
+        .map(|rule| {
+            let matches: Vec<_> = non_empty_ranges(&rule.pattern, &stripped)
+                .into_iter()
+                .map(|range| RuleMatch {
+                    claimed: claimed
+                        .get(range.clone())
+                        .map_or(0, |bytes| bytes.iter().filter(|&&b| !b).count()),
+                    range,
+                })
+                .collect();
+
+            // Only mark the bytes claimed now, as overlapping matches of the
+            // same rule (e.g. nested groups) don't hide each other.
+            for m in &matches {
+                if let Some(bytes) = claimed.get_mut(m.range.clone()) {
+                    bytes.fill(true);
+                }
+            }
+            matches
+        })
+        .collect();
+
+    Explanation {
+        sanitised: sanitised_text,
+        strips,
+        stripped,
+        rules,
+    }
+}
+
+fn non_empty_ranges(pattern: &Pattern, text: &str) -> Vec<Range<usize>> {
+    let mut ranges = Vec::new();
+    pattern.for_each_range(text, |range| {
+        if !range.is_empty() {
+            ranges.push(range);
+        }
+    });
+    ranges
+}
+
 /// Text with a flag for each of its bytes indicating whether it is special.
 #[derive(Debug, Default)]
 struct Marked {
@@ -750,6 +829,59 @@ mod tests {
             segments(&process("aéb".as_bytes(), &s, Escape::Unprintable)),
             [("a", NONE), ("é", RED), ("b", NONE)]
         );
+    }
+
+    fn rule_match(range: Range<usize>, claimed: usize) -> RuleMatch {
+        RuleMatch { range, claimed }
+    }
+
+    #[test]
+    #[allow(clippy::single_range_in_vec_init)]
+    fn explain_strip_and_rules() {
+        let s = scheme(
+            &[(r"^\S+ ", false), ("x*", false), ("nope", false)],
+            &[
+                ("b+", false, "red"),
+                ("ab", false, "blue"),
+                ("(a)(c)?", true, "red"),
+            ],
+        );
+        let e = explain(b"date abbb ab\tc\x1b", &s, Escape::Unprintable);
+        assert_eq!(e.sanitised, "date abbb ab\tc^[");
+        // Empty matches are not reported.
+        assert_eq!(e.strips, [vec![0..5], vec![], vec![]]);
+        assert_eq!(e.stripped, "abbb ab\tc^[");
+        assert_eq!(
+            e.rules,
+            [
+                vec![rule_match(1..4, 3), rule_match(6..7, 1)],
+                vec![rule_match(0..2, 1), rule_match(5..7, 1)],
+                vec![rule_match(0..1, 0), rule_match(5..6, 0)],
+            ]
+        );
+    }
+
+    #[test]
+    fn explain_nested_groups() {
+        // Matches of the same rule don't hide each other.
+        let s = scheme(&[], &[("b", false, "red"), ("((a)b)", true, "blue")]);
+        let e = explain(b"ab", &s, Escape::Unprintable);
+        assert_eq!(
+            e.rules,
+            [
+                vec![rule_match(1..2, 1)],
+                vec![rule_match(0..2, 1), rule_match(0..1, 1)]
+            ]
+        );
+    }
+
+    #[test]
+    fn explain_escape() {
+        let e = explain("a日".as_bytes(), &Scheme::default(), Escape::Wide);
+        assert_eq!(e.sanitised, "a\\u{65E5}");
+        assert_eq!(e.stripped, e.sanitised);
+        assert!(e.strips.is_empty());
+        assert!(e.rules.is_empty());
     }
 
     #[test]

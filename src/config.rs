@@ -27,6 +27,8 @@ pub struct Config {
     /// Maximal number of lines kept in each window.
     pub scrollback: NonZeroUsize,
     pub windows: Vec<Window>,
+    /// All the schemes defined, including those not used by any window.
+    pub schemes: BTreeMap<String, Arc<Scheme>>,
     pub status: StatusFormat,
     /// Which characters are shown as escapes.
     pub escape: Escape,
@@ -132,6 +134,7 @@ impl Default for Config {
         Self {
             scrollback: DEFAULT_SCROLLBACK,
             windows: Vec::new(),
+            schemes: BTreeMap::new(),
             status: StatusFormat::default(),
             escape: Escape::default(),
         }
@@ -175,6 +178,7 @@ impl Config {
         Ok(Self {
             scrollback: raw.scrollback.unwrap_or(DEFAULT_SCROLLBACK),
             windows,
+            schemes,
             status,
             escape: raw.escape.unwrap_or_default(),
         })
@@ -376,6 +380,12 @@ strip = [ { regex = '^\S+ ' } ]
         assert!(!plain.wrap);
         assert!(plain.scheme.strip.is_empty());
         assert!(plain.scheme.rules.is_empty());
+
+        assert_eq!(
+            config.schemes.keys().collect::<Vec<_>>(),
+            ["exim", "syslog", "unused"]
+        );
+        assert!(Arc::ptr_eq(&config.schemes["syslog"], &syslog.scheme));
     }
 
     #[test]

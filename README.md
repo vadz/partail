@@ -46,6 +46,7 @@ The binary is then `target/release/partail`.
 
 ```
 partail [-c CONFIG] [--escape unprintable|wide|non-bmp] [FILE...]
+partail [-c CONFIG] [--escape unprintable|wide|non-bmp] --test SCHEME [-v] [LINE...]
 ```
 
 Without arguments, `partail` shows the windows defined in its configuration
@@ -68,6 +69,8 @@ then seen by the scheme regexes and the search.
 
 When starting, only enough lines to fill the screen are read from the end of
 the existing files. Files created later are read entirely.
+
+The second form is used to test a scheme, see [below](#testing-schemes).
 
 ### Keys
 
@@ -190,6 +193,24 @@ A scheme defines how the lines of the windows using it are processed:
 
 All matches in the line are used, not just the first one. Both kinds of
 regexes use the [regex crate syntax](https://docs.rs/regex/latest/regex/#syntax).
+
+### Testing schemes
+
+`--test SCHEME` processes the lines given on the command line, or read from
+the standard input if there are none, with the given scheme and outputs them
+coloured using ANSI escape sequences, instead of following any files. This is
+useful for checking new rules or finding out why a line is not coloured as
+expected, e.g.
+
+```sh
+partail --test syslog 'Oct 21 12:00:00 host CRON[123]: error'
+tail -100 /var/log/syslog | partail --test syslog
+```
+
+With `-v`, what each strip pattern and rule matched is shown after each line,
+with the matches of each rule in its style. The matches of a rule which don't
+change the line because earlier rules already styled the same text are marked
+as `(overridden)`, or `(partly overridden)` if only a part of the match is.
 
 ### Styles
 
